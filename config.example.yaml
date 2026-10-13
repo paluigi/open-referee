@@ -1,0 +1,62 @@
+# Open Referee example configuration.
+# Copy to ~/.open-referee/config.yaml. API keys are read from environment
+# variables; the file stores only their NAMES.
+
+llm:
+  providers:
+    openrouter:
+      type: openai_compatible
+      base_url: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+    anthropic:
+      type: anthropic
+      api_key_env: ANTHROPIC_API_KEY
+    gemini:
+      type: gemini
+      api_key_env: GEMINI_API_KEY
+    ollama:
+      type: ollama
+      base_url: http://localhost:11434
+    vllm:
+      type: vllm
+      base_url: http://localhost:8000/v1
+  roles:
+    strong:   {provider: openrouter, model: anthropic/claude-sonnet-4.5}
+    small:    {provider: ollama,    model: llama3.1:8b}
+    vision:   {provider: gemini,    model: gemini-2.5-flash}
+  # Optional price table for cost estimation: "<provider>/<model>":
+  #   {input_per_mtok: USD, output_per_mtok: USD}
+  pricing:
+    openrouter/anthropic/claude-sonnet-4.5: {input_per_mtok: 3.0, output_per_mtok: 15.0}
+    gemini/gemini-2.5-flash:                {input_per_mtok: 0.30, output_per_mtok: 2.5}
+  request_timeout_s: 300
+  max_retries: 3
+
+openalex:
+  api_key_env: OPENALEX_API_KEY
+  email: you@institution.edu
+
+crossref:
+  email: you@institution.edu   # polite pool
+
+search:
+  order: [tavily, tinyfish, brave]   # user-set priority; failover top-down
+  tavily:   {api_key_env: TAVILY_API_KEY,   enabled: true}
+  tinyfish: {api_key_env: TINYFISH_API_KEY, enabled: true}
+  brave:    {api_key_env: BRAVE_API_KEY,    enabled: false}
+
+peer_review_sources:
+  pubpeer: true
+  openreview: true
+  prereview: true
+  # extra_sites: [reviews.example.org]
+
+review:
+  max_cost_usd: 10.0
+  max_parallel_calls: 8
+  max_user_literature_docs: 10
+
+server:
+  host: 127.0.0.1
+  port: 8410
+  # auth_token_env: OPEN_REFEREE_TOKEN   # optional bearer token for LAN use

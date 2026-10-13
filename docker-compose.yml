@@ -1,0 +1,20 @@
+services:
+  open-referee:
+    build: .
+    ports:
+      - "8410:8410"
+    volumes:
+      - referee-data:/data
+    environment:
+      # pass any keys you use; the config file references these names
+      - OPENROUTER_API_KEY
+      - ANTHROPIC_API_KEY
+      - GEMINI_API_KEY
+      - OPENALEX_API_KEY
+      - TAVILY_API_KEY
+      - TINYFISH_API_KEY
+      - BRAVE_API_KEY
+    restart: unless-stopped
+
+volumes:
+  referee-data:

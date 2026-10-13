@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Open Referee</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/alpine.min.js" defer></script>
+</head>
+<body>
+  <header>
+    <span class="brand">⚖️ Open Referee</span>
+    <nav>
+      <a href="/">Runs</a>
+      <a href="/settings">Settings</a>
+    </nav>
+  </header>
+  <main>
+    <section class="card" x-data="{busy:false}">
+      <h2>New review</h2>
+      <form hx-post="/api/reviews" hx-target="#run-result" hx-encoding="multipart/form-data"
+            @htmx:before-request="busy=true" @htmx:after-request="busy=false">
+        <label>Manuscript (PDF, DOCX, LaTeX, Markdown)
+          <input type="file" name="paper" accept=".pdf,.docx,.tex,.md,.markdown,.txt" required>
+        </label>
+        <label>Related-work PDFs (optional, max 10)
+          <input type="file" name="literature" multiple accept=".pdf,.docx,.tex,.md">
+        </label>
+        <button type="submit" :disabled="busy">Start review</button>
+      </form>
+      <div id="run-result"></div>
+    </section>
+
+    <section class="card">
+      <h2>Runs</h2>
+      {% if not runs %}<p class="muted">No runs yet.</p>{% endif %}
+      <ul class="runs">
+        {% for r in runs %}
+        <li>
+          <a href="/review/{{ r.run_id }}">{{ r.paper_title or r.run_id }}</a>
+          <span class="pill pill-{{ r.status }}">{{ r.status }}</span>
+          <span class="muted">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+  </main>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+  </script>
+</body>
+</html>

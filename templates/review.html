@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Review {{ run_id }} — Open Referee</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/alpine.min.js" defer></script>
+</head>
+<body>
+  <header>
+    <span class="brand">⚖️ Open Referee</span>
+    <nav><a href="/">← All runs</a></nav>
+  </header>
+  <main x-data="{ tab: 'overall' }">
+    <h1>{{ state.paper_title or run_id }} <span class="pill pill-{{ state.status }}">{{ state.status }}</span></h1>
+
+    {% if report %}
+    <div class="tabs">
+      <button :class="{active: tab==='overall'}" @click="tab='overall'">Overall</button>
+      <button :class="{active: tab==='comments'}" @click="tab='comments'">Comments ({{ report.comments | length }})</button>
+      <a class="btn" href="/api/reviews/{{ run_id }}/report.pdf">PDF</a>
+      <a class="btn" href="/api/reviews/{{ run_id }}/report.md">Markdown</a>
+      <a class="btn" href="/api/reviews/{{ run_id }}/report">JSON</a>
+    </div>
+
+    <section x-show="tab==='overall'" class="card">
+      <h2>Paper summary</h2>
+      <p>{{ report.paper_summary }}</p>
+      <h2>Overall feedback</h2>
+      <div class="prose">{% for line in report.overall_feedback.split('\n') %}{% if line.startswith('## ') %}<h3>{{ line[3:] }}</h3>{% elif line.startswith('# ') %}<h2>{{ line[2:] }}</h2>{% elif line.strip() %}<p>{{ line }}</p>{% endif %}{% endfor %}</div>
+      {% if report.validator_notes %}<h2>Validator notes</h2><div class="prose muted">{{ report.validator_notes }}</div>{% endif %}
+      {% if report.usage.estimated_cost_usd %}
+      <p class="muted">Usage: {{ '%d'|format(report.usage.total_input_tokens) }} in / {{ '%d'|format(report.usage.total_output_tokens) }} out tokens · est. ${{ '%.4f'|format(report.usage.estimated_cost_usd) }}</p>
+      {% endif %}
+    </section>
+
+    <section x-show="tab==='comments'" class="card">
+      {% for c in report.sorted_comments() %}
+      <article class="comment sev-{{ 'high' if c.score >= 0.6 else 'mid' if c.score >= 0.35 else 'low' }}">
+        <h3>{{ c.title }} <span class="pill">{{ '%.2f'|format(c.score) }}</span>
+          <span class="cat">{{ c.category }}</span>
+          {% if c.section %}<span class="muted">· {{ c.section }}</span>{% endif %}
+        </h3>
+        {% if c.quote %}<blockquote>{{ c.quote }}</blockquote>{% endif %}
+        <p>{{ c.message }}</p>
+        {% if c.anchor_confidence < 0.9 %}<p class="muted small">anchor confidence {{ '%.2f'|format(c.anchor_confidence) }}</p>{% endif %}
+      </article>
+      {% endfor %}
+    </section>
+    {% else %}
+    <section class="card" id="progress">
+      <h2>Reviewing…</h2>
+      <ul id="stage-log">
+        {% for ev in state.events %}
+        <li>{{ ev.stage.value }} — {{ ev.status.value }} {{ ev.message }}</li>
+        {% endfor %}
+      </ul>
+      {% if state.status == 'running' %}
+      <script>
+        const es = new EventSource('/api/reviews/{{ run_id }}/events');
+        es.onmessage = (e) => {
+          const ev = JSON.parse(e.data);
+          const li = document.createElement('li');
+          li.textContent = `${ev.stage} — ${ev.status} ${ev.message || ''}`;
+          document.getElementById('stage-log').appendChild(li);
+          if (ev.stage === 'assemble' && (ev.status === 'done' || ev.status === 'failed')) {
+            es.close();
+            if (ev.status === 'done') location.reload();
+          }
+        };
+      </script>
+      {% endif %}
+      {% if state.error %}<p class="error">{{ state.error }}</p>{% endif %}
+    </section>
+    {% endif %}
+  </main>
+</body>
+</html>

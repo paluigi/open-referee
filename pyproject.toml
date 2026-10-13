@@ -1,0 +1,81 @@
+[project]
+name = "open-referee"
+version = "0.1.0"
+description = "Open-source AI referee harness: deep, literature-grounded peer-review of academic papers with a local-first PWA."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Luigi Palumbo" }]
+keywords = ["peer-review", "academic", "llm", "openalex", "crossref"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "PyYAML>=6.0",
+    "httpx>=0.27",
+    "openalex-py>=0.1.0",
+    "pymupdf>=1.24",
+    "pylatexenc>=2.10",
+    "mammoth>=1.8",
+    "markdown-it-py>=3.0",
+    "sse-starlette>=2.1",
+]
+
+[project.optional-dependencies]
+pdf-export = ["weasyprint>=62"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.6",
+    "black>=24.8",
+]
+
+[project.scripts]
+open-referee = "open_referee.cli:main"
+
+[project.urls]
+Repository = "https://github.com/paluigi/open-referee"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/open_referee"]
+force-include = { "static" = "open_referee/static", "templates" = "open_referee/templates" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["UP042"]  # (str, Enum) kept for 3.11 compatibility & pydantic behavior
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI Depends() in defaults is the framework idiom
+"src/open_referee/server/app.py" = ["B008"]
+# pydantic model defaults calling constructors is intentional
+"src/open_referee/config/__init__.py" = ["B008"]
+"scripts/*" = ["E402"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
