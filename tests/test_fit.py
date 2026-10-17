@@ -143,6 +143,17 @@ async def test_fit_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tmp
     assert state.journal_profile == profile
     assert state.stage_status(Stage.FIT) is StageStatus.DONE
 
+    # run history: per-phase estimation record for the fit product
+    from open_referee.pipeline.history import load_run_history
+
+    history = load_run_history(home / "run_history.jsonl")
+    rec = next(r for r in history if r["run_id"] == "fit01")
+    assert rec["run_type"] == "fit" and rec["status"] == "completed"
+    assert rec["paper"]["chars"] > 0
+    assert rec["stages"]["fit"]["actual"]["calls"] == 1
+    assert rec["call_types"]["fit_assessment"]["actual_input_per_call"] > 0
+    assert rec["budget"]["actual_usd"] > 0
+
 
 async def test_fit_requires_journal_profile(test_config, sample_paper_file, tmp_path):
     cfg = fit_config(tmp_path)
@@ -170,6 +181,16 @@ async def test_fit_unpriced_model_is_a_hard_error(
     state = RunState.load("fit03")
     assert state.status == "failed"
     assert "llm.pricing" in (state.error or "")
+
+    # aborted runs still record paper stats + zero spend for calibration
+    from open_referee.pipeline.history import load_run_history
+
+    history = load_run_history(home / "run_history.jsonl")
+    rec = next(r for r in history if r["run_id"] == "fit03")
+    assert rec["status"] == "failed"
+    assert "llm.pricing" in (rec["error"] or "")
+    assert rec["budget"]["actual_usd"] == 0.0
+    assert rec["paper"]["chars"] > 0
 
 
 async def test_fit_budget_below_single_call_is_infeasible(

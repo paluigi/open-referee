@@ -302,6 +302,7 @@ class ReviewPipeline:
             state.status = "completed"
             state.save()
             await self._emit(Stage.ASSEMBLE, StageStatus.DONE, "report ready")
+            self._record_history("completed")
             return report
         except (PricingError, BudgetInfeasible) as e:
             # pre-spend abort: no partial report is possible or meaningful
@@ -309,6 +310,7 @@ class ReviewPipeline:
                 state.status = "failed"
                 state.error = str(e)
                 state.save()
+            self._record_history("failed", str(e))
             await self._emit(Stage.ASSEMBLE, StageStatus.FAILED, f"cannot run: {e}")
             raise
         except BudgetExceeded as e:
@@ -318,6 +320,7 @@ class ReviewPipeline:
                 state.status = "failed"
                 state.error = str(e)
                 state.save()
+            self._record_history("budget_exceeded", str(e))
             await self._emit(Stage.ASSEMBLE, StageStatus.FAILED, f"budget cap reached: {e}")
             doc: Document | None = getattr(self, "_ingested_doc", None)
             if doc is not None and state is not None:
@@ -348,6 +351,7 @@ class ReviewPipeline:
                 state.status = "failed"
                 state.error = str(e)
                 state.save()
+            self._record_history("failed", str(e))
             logger.exception("pipeline failed")
             raise
         finally:
@@ -429,7 +433,7 @@ class ReviewPipeline:
             try:
                 restored = ReviewPlan.model_validate(self.state.plan)
                 restored.budget_usd = self._effective_budget()
-                harness.set_plan(restored)
+                harness.set_plan(restored, reason="restored-resume")
             except Exception:
                 logger.warning("could not restore persisted plan; replanning")
         if harness.plan is not None:
@@ -442,13 +446,13 @@ class ReviewPipeline:
             logger.warning("pricing incomplete, budget tracking degraded: %s", e)
         if self._is_auto():
             plan = harness.deterministic_plan(reason="preflight")
-            harness.set_plan(plan)
+            harness.set_plan(plan, reason="preflight-v0")
             await self._emit_plan_event("plan v0 (deterministic preflight)", plan)
         else:
             depth = self._effective_depth()
             knobs = PlanKnobs.from_preset(self.cfg.review.depth_preset())
             plan = harness.preset_plan(knobs, depth)
-            harness.set_plan(plan)
+            harness.set_plan(plan, reason="preset-tracking")
             await self._emit_plan_event(f"tracking preset '{depth}' spend", plan)
         self._sync_budget_to_state()
         self.state.save()
@@ -481,7 +485,7 @@ class ReviewPipeline:
             res = {}
         harness.plan.planner_calls_used += 1
         plan = self._planner_response_to_plan(harness, res, milestone)
-        harness.set_plan(plan)
+        harness.set_plan(plan, reason=f"{milestone}-milestone")
         await self._emit(
             Stage.PLAN,
             StageStatus.RUNNING,
@@ -551,7 +555,7 @@ class ReviewPipeline:
             return
         if steering.action == "applied" and steering.applied is not None:
             plan = harness.apply_option(steering.applied, reason=reason)
-            harness.set_plan(plan)
+            harness.set_plan(plan, reason=f"steering:{steering.applied.action}")
             await self._emit(
                 Stage.PLAN,
                 StageStatus.RUNNING,
@@ -600,7 +604,7 @@ class ReviewPipeline:
         if chosen is None:
             chosen = options[0]  # largest projected savings (sorted desc)
         plan = harness.apply_option(chosen, reason=reason, source="planner")
-        harness.set_plan(plan)
+        harness.set_plan(plan, reason=f"planner-choose:{chosen.action}")
         return plan
 
     def _sync_budget_to_state(self) -> None:
@@ -611,6 +615,31 @@ class ReviewPipeline:
         if h is not None:
             self.state.plan = h.plan.model_dump(mode="json") if h.plan else None
             self.state.ledger_calls = [c.model_dump(mode="json") for c in h.ledger.calls]
+
+    def _record_history(self, status: str, error: str | None = None) -> None:
+        """Append the per-phase estimation record (paper characteristics +
+        budget/spend detail) to the run-history store. Best-effort: a history
+        failure must never break the run itself."""
+        try:
+            from open_referee.pipeline.history import build_run_record, upsert_run_record
+
+            pool = getattr(self, "_pool", None)
+            if pool is None or pool.harness is None:
+                return
+            rec = build_run_record(
+                run_id=self.run_id,
+                run_type="review",
+                status=status,
+                harness=pool.harness,
+                events=self.state.events if self.state is not None else [],
+                paper_title=self.state.paper_title if self.state is not None else "",
+                depth_mode=self._effective_depth(),
+                error=error,
+                models={r.value: f"{p.provider_name}/{p.model}" for r, p in pool.specs.items()},
+            )
+            upsert_run_record(rec)
+        except Exception:
+            logger.exception("failed to record run history")
 
     # --------------------------------------------------------- plan knobs --
 

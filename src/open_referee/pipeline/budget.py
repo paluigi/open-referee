@@ -227,6 +227,9 @@ class BudgetHarness:
         self.auto = auto
         self.stats = DocumentStats()
         self.plan: ReviewPlan | None = None
+        # plan-version trajectory: one snapshot per set_plan() call, with the
+        # spend at the moment of the change (estimation-history dataset)
+        self.plan_log: list[dict] = []
         # call_type -> actual call count / empirical token averages
         self.done: dict[str, int] = {}
         self._emp_in: dict[str, float] = {}
@@ -473,8 +476,20 @@ class BudgetHarness:
 
     # ------------------------------------------------------- plan handling --
 
-    def set_plan(self, plan: ReviewPlan) -> None:
+    def set_plan(self, plan: ReviewPlan, reason: str = "") -> None:
         self.plan = plan
+        self.plan_log.append(
+            {
+                "ts": datetime.now(UTC).isoformat(),
+                "plan_version": plan.plan_version,
+                "based_on": plan.based_on,
+                "reason": reason,
+                "target_usd": plan.target_usd,
+                "planned_usd": round(plan.planned_cost(), 6),
+                "knobs": plan.knobs.model_dump(),
+                "spend_usd_at_change": round(self.ledger.total_cost(), 6),
+            }
+        )
 
     def validate_plan(self, plan: ReviewPlan, source: str = "planner") -> ReviewPlan:
         """Never trust LLM arithmetic: clamp knobs, recompute cost with the

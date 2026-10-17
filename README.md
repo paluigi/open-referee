@@ -144,6 +144,26 @@ then works like this:
    a small reserve. Fan-out loops gate per call, so claim verification
    degrades gracefully (importance-first) instead of crashing into the cap.
 
+### Run history (estimation dataset)
+
+Every run — review or fit, completed or failed — appends one JSON line to
+`~/.open-referee/run_history.jsonl` (one line per run; resumed runs update
+theirs in place). Each record pairs the paper's characteristics (length,
+sections, figures/tables, references, claims, lenses) with the full budget
+story at three levels of detail:
+
+- **per stage**: status, timing, and planned vs actual calls/tokens/cost
+  for every phase of the review (triage, claims, verify, challenge, …);
+- **per call type**: the calibration pair — estimated in/out tokens per
+  call vs the observed average, plus planned/actual counts and costs;
+- **per call**: an ordered spend timeline with cumulative cost, and the
+  plan-version trajectory (`preflight-v0 → claims-milestone → …`) with the
+  spend at each change.
+
+Tokens are recorded alongside dollars so the dataset stays valid when
+prices change; it is the base for improving the cost model's estimates in
+future versions.
+
 ### Desk-reject estimator
 
 The *Journal fit estimate* card takes a paper plus a free-form venue

@@ -170,6 +170,7 @@ class FitPipeline:
                 report = self._assemble(res, doc.title, journal_profile, harness)
                 state.status = "completed"
                 state.save()
+                self._record_history("completed")
                 await self._emit(Stage.ASSEMBLE, StageStatus.DONE, "fit report ready")
                 return report
             finally:
@@ -179,6 +180,7 @@ class FitPipeline:
                 state.status = "failed"
                 state.error = str(e)
                 state.save()
+            self._record_history("failed", str(e))
             await self._emit(Stage.ASSEMBLE, StageStatus.FAILED, f"cannot run: {e}")
             raise
         except Exception as e:
@@ -186,8 +188,33 @@ class FitPipeline:
                 state.status = "failed"
                 state.error = str(e)
                 state.save()
+            self._record_history("failed", str(e))
             logger.exception("fit pipeline failed")
             raise
+
+    def _record_history(self, status: str, error: str | None = None) -> None:
+        """Append the per-phase estimation record to the run-history store.
+        Best-effort: a history failure must never break the run itself."""
+        try:
+            from open_referee.pipeline.history import build_run_record, upsert_run_record
+
+            pool = getattr(self, "_pool", None)
+            if pool is None or pool.harness is None:
+                return
+            rec = build_run_record(
+                run_id=self.run_id,
+                run_type="fit",
+                status=status,
+                harness=pool.harness,
+                events=self.state.events if self.state is not None else [],
+                paper_title=self.state.paper_title if self.state is not None else "",
+                depth_mode="fit",
+                error=error,
+                models={r.value: f"{p.provider_name}/{p.model}" for r, p in pool.specs.items()},
+            )
+            upsert_run_record(rec)
+        except Exception:
+            logger.exception("failed to record run history")
 
     # -------------------------------------------------------------- assemble --
 

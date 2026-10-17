@@ -368,6 +368,24 @@ async def test_auto_mode_budget_driven_e2e(test_config, sample_paper_file, monke
     assert "Built with [open-referee](https://github.com/paluigi/open-referee)" in md
     assert "$" in md
 
+    # run history: per-phase estimation record persisted for calibration
+    from open_referee.pipeline.history import load_run_history
+
+    history = load_run_history(home / "run_history.jsonl")
+    rec = next(r for r in history if r["run_id"] == "auto01")
+    assert rec["run_type"] == "review" and rec["status"] == "completed"
+    assert rec["depth_mode"] == "auto"
+    assert rec["paper"]["n_claims"] == 1
+    assert rec["budget"]["actual_usd"] > 0
+    assert rec["stages"]["verify"]["actual"]["cost_usd"] > 0
+    assert rec["stages"]["triage"]["control_plane"] is True
+    assert rec["stages"]["triage"]["duration_s"] is not None
+    assert "preflight-v0" in [e["reason"] for e in rec["plan_log"]]
+    assert "claims-milestone" in [e["reason"] for e in rec["plan_log"]]
+    assert any(e["call_type"] == "planner" for e in rec["spend_timeline"])
+    assert rec["call_types"]["claim_verify"]["actual_input_per_call"] is not None
+    assert rec["pricing"]["fake/strong-fake"]["input_per_mtok"] == 3.0
+
 
 async def test_resume_restores_spend_accounting(
     test_config, sample_paper_file, monkeypatch, tmp_path

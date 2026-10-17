@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Added — run history (estimation dataset)
+
+- **`pipeline/history.py`**: every run (review and fit, whatever the
+  outcome) writes one JSON line to `~/.open-referee/run_history.jsonl`,
+  keyed by run_id (resumed runs update their line instead of
+  double-counting; atomic write; corrupt lines tolerated).
+- Records pair paper characteristics (document stats: chars, sections,
+  figures, tables, references, theorems, claims, lenses) with the budget
+  story at three levels: per pipeline stage (status, timing from the event
+  log, planned vs actual calls/tokens/cost), per call type (estimated vs
+  observed in/out tokens per call — the calibration pair, tokens being
+  pricing-independent), and per individual call (ordered spend timeline
+  with cumulative cost). The plan-version trajectory (preflight → milestone
+  → steering adjustments, with spend at each change) is included, plus
+  models and the pricing snapshot.
+- Recorded at every exit path: success, preflight failures (paper stats +
+  zero spend), budget-exceeded partial drains, and generic failures —
+  best-effort, never breaks the run. `load_run_history()` is the reader
+  future calibration/analysis code starts from.
+
 ### Added — budget-driven review mode (`auto`), desk-reject estimator, report metadata
 
 - **Budget harness** (`pipeline/budget.py`): document-statistics cost model
