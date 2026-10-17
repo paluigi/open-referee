@@ -50,7 +50,10 @@ async def run_claim_inventory(
     )
     try:
         res = await pool.complete_json(
-            ModelRole.STRONG, prompts_claims.CLAIM_INVENTORY_SYSTEM, user
+            ModelRole.STRONG,
+            prompts_claims.CLAIM_INVENTORY_SYSTEM,
+            user,
+            call_type="claim_inventory",
         )
     except Exception as e:
         logger.warning("claim inventory failed: %s", e)
@@ -74,18 +77,23 @@ async def verify_claims(
     pipeline, pool: RolePool, doc: Document, claims: list[dict], cfg: Config
 ) -> list[dict]:
     """Per-claim verification workers, parallel with the configured cap."""
-    preset = cfg.review.depth_preset()
+    knobs = pipeline.plan_knobs()
     # central claims first, then supporting; peripheral only if budget remains
     order = {"central": 0, "supporting": 1, "peripheral": 2}
     ordered = sorted(claims, key=lambda c: order.get(str(c.get("importance")).lower(), 1))
-    selected = ordered[: preset.max_claims]
+    selected = ordered[: knobs.max_claims]
 
     sem = asyncio.Semaphore(cfg.review.max_parallel_calls)
     results: list[dict] = []
+    verified = 0
 
     # definitions packs: built lazily per theorem environment, keyed by anchor
     async def verify_one(claim: dict):
+        nonlocal verified
         async with sem:
+            if not pipeline.budget_allows("claim_verify"):
+                return []
+            verified += 1
             ctype = str(claim.get("type")).lower()
             role = CLAIM_TYPE_ROLES.get(ctype, ModelRole.SMALL)
             system = prompts_claims.claim_verify_system(ctype)
@@ -100,7 +108,7 @@ async def verify_claims(
                 definitions=defs[:6000],
             )
             try:
-                res = await pool.complete_json(role, system, user)
+                res = await pool.complete_json(role, system, user, call_type="claim_verify")
             except Exception as e:
                 logger.warning("claim %s (%s) failed: %s", claim.get("id"), ctype, e)
                 return []
@@ -116,6 +124,13 @@ async def verify_claims(
     tasks = [verify_one(c) for c in selected]
     for r in await asyncio.gather(*tasks):
         results.extend(r)
+    if verified < len(selected):
+        pipeline._note_gate_stop("claim_verify")
+        await pipeline._emit(
+            Stage.VERIFY,
+            StageStatus.RUNNING,
+            f"claim verification stopped at {verified}/{len(selected)} (budget projection)",
+        )
     return results
 
 
@@ -174,7 +189,7 @@ def find_mentions(doc: Document, kind: str, artifact_id: str) -> list[str]:
 async def verify_artifacts(pipeline, pool: RolePool, doc: Document, cfg: Config) -> list[dict]:
     """Vision verification of ALL figures and tables against the prose."""
     out: list[dict] = []
-    preset = cfg.review.depth_preset()
+    knobs = pipeline.plan_knobs()
     if ModelRole.VISION not in pool.providers:
         return out
 
@@ -187,6 +202,9 @@ async def verify_artifacts(pipeline, pool: RolePool, doc: Document, cfg: Config)
     ):
         async with sem:
             if not image and not text_block:
+                return []
+            if not pipeline.budget_allows("artifact_verify"):
+                pipeline._note_gate_stop("artifact_verify")
                 return []
             mentions = find_mentions(doc, kind, artifact_id)
             if not mentions:
@@ -219,7 +237,9 @@ async def verify_artifacts(pipeline, pool: RolePool, doc: Document, cfg: Config)
             try:
                 await pool.ledger.check_budget(spec, 4000, 2000)
                 resp = await vision.complete(messages, json_mode=True)
-                await pool.ledger.record(spec, "vision", resp)
+                rec = await pool.ledger.record(spec, "vision", resp, call_type="artifact_verify")
+                if pool.harness is not None:
+                    pool.harness.note_record(rec)
                 from open_referee.providers.adapters import extract_json
 
                 comments = extract_json(resp.text).get("comments", [])
@@ -235,10 +255,10 @@ async def verify_artifacts(pipeline, pool: RolePool, doc: Document, cfg: Config)
                 return []
 
     tasks = []
-    for fig in doc.figures[: preset.max_artifacts]:
+    for fig in doc.figures[: knobs.max_artifacts]:
         if fig.image_data_url:
             tasks.append(check("figure", fig.id, fig.image_data_url, None, fig.page))
-    for tbl in doc.tables[: preset.max_artifacts]:
+    for tbl in doc.tables[: knobs.max_artifacts]:
         if tbl.image_data_url or tbl.markdown:
             tasks.append(check("table", tbl.id, tbl.image_data_url, tbl.markdown, tbl.page))
     for r in await asyncio.gather(*tasks):
@@ -266,14 +286,17 @@ async def defense_round(
     Only for comments whose anchor resolves to document text (unanchored ones
     go straight to the meta-reviewer, which re-checks them globally).
     """
-    preset = cfg.review.depth_preset()
-    if not preset.defense_round or not candidates:
+    knobs = pipeline.plan_knobs()
+    if not knobs.defense_round or not candidates:
         return list(candidates)
 
     sem = asyncio.Semaphore(cfg.review.max_parallel_calls)
 
     async def gate(c: dict) -> dict | None:
         async with sem:
+            if not pipeline.budget_allows("defense"):
+                pipeline._note_gate_stop("defense")
+                return c  # gate failure never drops a comment
             anchor = c.get("paragraph_anchor") or c.get("quote") or ""
             passage = _passage_for(doc, anchor) or "(anchor not found in document)"
             try:
@@ -286,6 +309,7 @@ async def defense_round(
                         message=(c.get("message") or "")[:1500],
                         passage=passage[:2500],
                     ),
+                    call_type="defense",
                 )
                 adjudication = await pool.complete_json(
                     ModelRole.STRONG,
@@ -299,6 +323,7 @@ async def defense_round(
                         defense=(defense.get("defense") or "")[:2000],
                         passage=passage[:2500],
                     ),
+                    call_type="adjudication",
                 )
             except Exception as e:
                 logger.warning("defense gate failed for %s: %s", c.get("title"), e)

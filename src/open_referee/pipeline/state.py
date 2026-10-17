@@ -28,6 +28,8 @@ class Stage(str, Enum):
     META = "meta"
     VALIDATE = "validate"
     ASSEMBLE = "assemble"
+    PLAN = "plan"  # pseudo-stage: budget planning / adjustment events
+    FIT = "fit"  # desk-reject fit assessment product
 
 
 class StageStatus(str, Enum):
@@ -45,7 +47,9 @@ class StageEvent(BaseModel):
     message: str = ""
     progress: float | None = None  # 0..1 within stage
     ts: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    data: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    # structured payload (budget telemetry, plan snapshots); serialized so
+    # finished runs can replay it over SSE
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunState(BaseModel):
@@ -61,6 +65,13 @@ class RunState(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     status: str = "running"  # running | completed | failed
     error: str | None = None
+    # product + budget context for the run
+    run_type: str = "review"  # review | fit
+    requested_depth: str | None = None  # per-run depth override (auto/fast/standard/deep)
+    budget_usd: float | None = None  # per-run budget override
+    journal_profile: str | None = None  # free-form venue profile text
+    plan: dict[str, Any] | None = None  # serialized ReviewPlan (budget tracking)
+    ledger_calls: list[dict[str, Any]] = Field(default_factory=list)  # persisted CallRecords
 
     def model_post_init(self, __context) -> None:
         # normalize stage dict entries back to StageStatus after JSON round-trip

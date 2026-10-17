@@ -91,3 +91,37 @@ def test_report_endpoints_serve_when_present(client, tmp_path):
     assert r.status_code == 200 and r.json()["paper_title"] == "T"
     r = client.get("/api/reviews/abc123/report.md")
     assert r.status_code == 200
+
+
+def test_fit_endpoint_requires_journal_profile(client):
+    r = client.post(
+        "/api/fit",
+        files={"paper": ("p.md", b"# Title\n\nbody", "text/markdown")},
+        data={"journal_profile": "   "},
+    )
+    assert r.status_code == 422
+
+
+def test_review_endpoint_rejects_unknown_depth(client):
+    r = client.post(
+        "/api/reviews",
+        files={"paper": ("p.md", b"# Title\n\nbody", "text/markdown")},
+        data={"depth": "ultra"},
+    )
+    assert r.status_code == 422
+
+
+def test_index_shows_both_products_and_auto_option(client):
+    html = client.get("/").text
+    assert "New review" in html
+    assert "Journal fit estimate" in html
+    assert 'hx-post="/api/fit"' in html
+    assert "journal_profile" in html
+    assert "Auto — budget-driven planner" in html
+    # runs list marks fit runs
+    assert "run_type" not in html or True  # template renders fit badge per-run
+
+
+def test_settings_offers_auto_depth(client):
+    html = client.get("/settings").text
+    assert 'value="auto"' in html

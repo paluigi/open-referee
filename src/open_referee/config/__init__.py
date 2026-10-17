@@ -156,7 +156,11 @@ class ReviewConfig(BaseModel):
     max_cost_usd: float = 10.0
     max_parallel_calls: int = 8
     max_user_literature_docs: int = 10
-    depth: str = "standard"  # fast | standard | deep
+    depth: str = "standard"  # fast | standard | deep | auto (budget-driven)
+
+    @property
+    def is_auto(self) -> bool:
+        return self.depth.lower().strip() == "auto"
 
     def depth_preset(self) -> DepthPreset:
         presets = {
@@ -177,8 +181,13 @@ class ReviewConfig(BaseModel):
             ),
         }
         key = self.depth.lower().strip()
+        if key == "auto":
+            raise ValueError(
+                "depth 'auto' has no fixed preset — the budget planner sets the "
+                "knobs; use ReviewPipeline.plan_knobs() instead of depth_preset()"
+            )
         if key not in presets:
-            raise ValueError(f"Unknown depth preset '{self.depth}' (fast|standard|deep)")
+            raise ValueError(f"Unknown depth preset '{self.depth}' (fast|standard|deep|auto)")
         return presets[key]
 
 
@@ -254,6 +263,10 @@ def example_config_text() -> str:
                         "output_per_mtok": 15.0,
                     },
                     "ollama/llama3.1:8b": {"input_per_mtok": 0.0, "output_per_mtok": 0.0},
+                    "gemini/gemini-2.5-flash": {
+                        "input_per_mtok": 0.30,
+                        "output_per_mtok": 2.5,
+                    },
                 },
             },
             "openalex": {"api_key_env": "OPENALEX_API_KEY", "email": "you@institution.edu"},
@@ -265,7 +278,12 @@ def example_config_text() -> str:
                 "brave": {"api_key_env": "BRAVE_API_KEY", "enabled": False},
             },
             "peer_review_sources": {"pubpeer": True, "openreview": True, "prereview": True},
-            "review": {"max_cost_usd": 10.0, "max_parallel_calls": 8},
+            "review": {
+                "max_cost_usd": 10.0,
+                "max_parallel_calls": 8,
+                # auto = budget-driven planner (requires llm.pricing entries)
+                "depth": "standard",
+            },
             "server": {"host": "127.0.0.1", "port": 8410},
         },
         sort_keys=False,

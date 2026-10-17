@@ -2,9 +2,79 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from open_referee.report.models import ReviewReport
+from open_referee.report.models import (
+    TOOL_NAME,
+    TOOL_URL,
+    FitReport,
+    PlanSummary,
+    ReviewReport,
+)
+
+
+def _fmt_int(n: float) -> str:
+    return f"{int(n):,}"
+
+
+def _usage_table(usage, model_roles: dict[str, str]) -> list[str]:
+    """Markdown table: one row per role/model + totals. Empty if no usage."""
+    if not usage.tokens_by_role:
+        return []
+    rows = [
+        "## Build metadata",
+        "",
+        "| Role | Model | Calls | Input tokens | Output tokens | Est. cost |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
+    ]
+    for role in sorted(usage.tokens_by_role):
+        agg = usage.tokens_by_role[role]
+        model = model_roles.get(role, "?")
+        rows.append(
+            f"| {role} | `{model}` | {int(agg.get('calls', 0))} | "
+            f"{_fmt_int(agg.get('input_tokens', 0))} | {_fmt_int(agg.get('output_tokens', 0))} | "
+            f"${agg.get('cost_usd', 0.0):.4f} |"
+        )
+    rows.append(
+        f"| **Total** | | {sum(int(a.get('calls', 0)) for a in usage.tokens_by_role.values())} | "
+        f"**{_fmt_int(usage.total_input_tokens)}** | **{_fmt_int(usage.total_output_tokens)}** | "
+        f"**${usage.estimated_cost_usd:.4f}** |"
+    )
+    rows.append("")
+    return rows
+
+
+def _plan_lines(plan: PlanSummary | None) -> list[str]:
+    if plan is None:
+        return []
+    out: list[str] = []
+    bits = [f"Budget: ${plan.budget_usd:.2f}" if plan.budget_usd is not None else None]
+    if plan.target_usd is not None:
+        bits.append(f"planned target ${plan.target_usd:.2f}")
+    bits.append(f"spent ${plan.spent_usd:.2f}")
+    if plan.control_spent_usd:
+        bits.append(f"control-plane overhead ${plan.control_spent_usd:.2f}")
+    if plan.projected_final_usd is not None and plan.mode != "fit":
+        bits.append(f"projected ${plan.projected_final_usd:.2f}")
+    if plan.mode == "auto":
+        bits.append(f"{plan.planner_calls_used} planner call(s)")
+    out.append("_" + " · ".join(b for b in bits if b) + f" ({plan.mode} mode)_")
+    for adj in plan.adjustments[-8:]:  # keep the report readable
+        out.append(f"- adjustment: {adj}")
+    if plan.notes:
+        out.append(f"- {plan.notes}")
+    out.append("")
+    return out
+
+
+def _attribution_lines() -> list[str]:
+    return [
+        "---",
+        "",
+        f"Built with [{TOOL_NAME}]({TOOL_URL})",
+        "",
+    ]
 
 
 def render_markdown(report: ReviewReport) -> str:
@@ -26,21 +96,72 @@ def render_markdown(report: ReviewReport) -> str:
         parts += ["", c.message, ""]
     if report.validator_notes:
         parts += ["## Validator notes", "", report.validator_notes, ""]
-    if report.usage.estimated_cost_usd or report.usage.total_input_tokens:
-        u = report.usage
-        parts += [
-            "## Usage",
-            "",
-            f"Input tokens: {u.total_input_tokens:,} · Output tokens: {u.total_output_tokens:,} · "
-            f"Estimated cost: ${u.estimated_cost_usd:.4f}",
-            "",
-        ]
+    if report.plan_summary:
+        parts += _plan_lines(report.plan_summary)
+    parts += _usage_table(report.usage, report.model_roles)
+    parts += _attribution_lines()
     return "\n".join(parts)
 
 
-def render_pdf(report: ReviewReport, out_path: str | Path) -> Path:
-    """PDF export of the review report. Uses weasyprint when available."""
-    md = render_markdown(report)
+def render_fit_markdown(report: FitReport) -> str:
+    p = report.probability_not_desk_rejected
+    parts = [f"# Journal fit estimate — {report.paper_title}", ""]
+    parts.append(f"_Generated {report.generated_at:%Y-%m-%d %H:%M UTC} · run `{report.run_id}`_")
+    if report.model_roles:
+        roles = ", ".join(f"{role}: `{spec}`" for role, spec in sorted(report.model_roles.items()))
+        parts.append(f"_Models — {roles}_")
+    parts += [""]
+
+    parts += ["## Probability of passing the desk screen", ""]
+    parts.append(f"**{p:.0%}** (calibrated decision model)")
+    if report.llm_holistic_estimate is not None:
+        parts.append(f"LLM holistic estimate: **{report.llm_holistic_estimate:.0%}**")
+    parts += [""]
+    w = report.calibration
+    weights_str = " + ".join(f"{w.get(f.name, 0.0):g}·{f.name}" for f in report.factors)
+    parts.append(
+        f"_Calibration: `sigmoid({w.get('bias', 0.0):g} + {weights_str})` "
+        "(0.5 is imputed for any unassessed factor; weights favor scope and aim, "
+        "which desk screens hinge on)._"
+    )
+    parts += [""]
+
+    parts += ["## Factor assessment", ""]
+    for f in report.factors:
+        parts.append(f"### {f.label} — {f.score:.2f} / 1.00")
+        if f.evidence:
+            parts += ["", f"> {f.evidence}"]
+        parts += ["", f.rationale or "_(no rationale provided)_", ""]
+
+    if report.reasoning:
+        parts += ["## Editor reasoning", "", report.reasoning, ""]
+    if report.risks:
+        parts += ["## Key risks", ""]
+        parts += [f"- {r}" for r in report.risks] + [""]
+    if report.suggestions:
+        parts += ["## Suggestions to improve fit", ""]
+        parts += [f"- {s}" for s in report.suggestions] + [""]
+
+    if report.journal_profile:
+        parts += [
+            "## Venue profile (as provided)",
+            "",
+            "> " + report.journal_profile.replace("\n", "\n> "),
+            "",
+        ]
+
+    if report.plan_summary:
+        parts += _plan_lines(report.plan_summary)
+    parts += _usage_table(report.usage, report.model_roles)
+    parts += _attribution_lines()
+    return "\n".join(parts)
+
+
+def render_pdf(report: ReviewReport | FitReport, out_path: str | Path) -> Path:
+    """PDF export of a review or fit report. Uses weasyprint when available."""
+    md = (
+        render_markdown(report) if isinstance(report, ReviewReport) else render_fit_markdown(report)
+    )
     html = _markdown_to_html(md)
     out = Path(out_path)
     try:
@@ -51,6 +172,10 @@ def render_pdf(report: ReviewReport, out_path: str | Path) -> Path:
     except ImportError:
         pass
     return _render_pdf_fallback(report, md, out)
+
+
+def render_fit_pdf(report: FitReport, out_path: str | Path) -> Path:
+    return render_pdf(report, out_path)
 
 
 def _markdown_to_html(md: str) -> str:
@@ -69,20 +194,25 @@ table {{ border-collapse: collapse; }} th, td {{ border: 1px solid #999; padding
 </style></head><body>{body}</body></html>"""
 
 
-def _render_pdf_fallback(report: ReviewReport, md: str, out: Path) -> Path:
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+
+def _render_pdf_fallback(report, md: str, out: Path) -> Path:
     """Minimal plaintext PDF via reportlab if weasyprint is missing."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
     styles = getSampleStyleSheet()
-    doc = SimpleDocTemplate(str(out), pagesize=A4, title=f"Review report — {report.paper_title}")
+    doc = SimpleDocTemplate(str(out), pagesize=A4, title=f"Report — {report.paper_title}")
     flow = []
     for line in md.splitlines():
         if not line.strip():
             flow.append(Spacer(1, 6))
             continue
         txt = line.replace("&", "&amp;").replace("<", "&lt;")
+        # reportlab paragraphs have no markdown links: [text](url) -> text (url)
+        txt = _MD_LINK_RE.sub(r"\1 (\2)", txt)
         if line.startswith("# "):
             flow.append(Paragraph(f"<b><font size=16>{txt[2:]}</font></b>", styles["Normal"]))
         elif line.startswith("## "):

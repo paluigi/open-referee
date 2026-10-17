@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+### Added — budget-driven review mode (`auto`), desk-reject estimator, report metadata
+
+- **Budget harness** (`pipeline/budget.py`): document-statistics cost model
+  for every pipeline step, per-call-type unit costs that adapt to observed
+  token usage, and plan-vs-actual tracking in two buckets — control plane
+  (triage, claim inventory, surveyor, planner calls themselves + a small
+  replanning contingency) and review plane. The budget is a hard ceiling;
+  the plan target is soft.
+- **Preflight feasibility check** (free, after ingestion): auto mode
+  hard-errors on unpriced models (with the exact `llm.pricing` YAML to add;
+  explicit `0.0` counts as priced for local models) and on budgets below
+  the cost of a meaningful minimum review, suggesting the minimum and
+  standard-quality budgets. Preset modes keep working unpriced (warning).
+- **Deterministic planner**: greedy quality ordering (claims → whole-paper
+  pass → defense gate → lenses → artifacts) used for plan v0, preflight
+  numbers, and as the fallback whenever the planner LLM fails.
+- **Planner LLM** (auto mode, small role): one baseline call after the
+  claims milestone (the dominant cost driver), plus throttled mid-run
+  adjustments — max 4 planner calls per run, only on material deviation
+  (>20% over target or projection >95% of budget). Plans are validated and
+  repaired deterministically; LLM arithmetic is never trusted.
+- **Deterministic-first steering**: at stage boundaries the harness applies
+  forced repairs without any LLM call; only multi-option judgment calls go
+  to the planner, choosing among pre-costed repair options (trim claims,
+  drop lenses/artifacts/defense/whole-paper pass).
+- **Fan-out budget gating**: per-claim verification, artifact checks, and
+  defense pairs check the projection before each call and stop
+  importance-first with an event instead of tripping the cap mid-stage.
+- **Per-run overrides**: depth and budget settable on the review form
+  (auto/fast/standard/deep + USD), journal-profile textarea as optional
+  venue context injected into triage/challenger/meta/validator prompts.
+- **Resume keeps spend accounting**: plan + full ledger persisted in
+  `state.json`; a re-run with the same run_id restores them (and TRIAGE is
+  now properly resumable).
+- **Desk-reject estimator** (new product): free-form journal/venue profile
+  (aim/scope/metrics/institutional considerations) + manuscript → six
+  evidence-grounded factor scores from one strong-model call → probability
+  of not being desk-rejected via a transparent weighted-logistic decision
+  model (weights printed in the report). Own card on the home page, own
+  report (`FitReport`, md/pdf/json), `run_type="fit"` runs.
+- **Report build metadata + attribution**: all reports (review and fit)
+  carry a build-metadata table (role, model, calls, in/out tokens, cost),
+  the budget story (budget/target/spent/control overhead/adjustments/gate
+  stops), and a *built with open-referee* link to the repository. PDF
+  fallback renders links as plain `text (url)`.
+- Budget telemetry streamed over SSE (`plan` pseudo-stage) with a live
+  budget panel on the run page; `StageEvent.data` is now serialized so
+  finished runs replay it.
+
 ### Added — verification-mechanics rework (decomposition approach)
 
 - **Claim inventory stage** (strong model): exhaustive catalogue of

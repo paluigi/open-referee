@@ -8,7 +8,7 @@ import re
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -21,8 +21,9 @@ from open_referee.config import (
     save_config,
 )
 from open_referee.pipeline import RunState, Stage, StageEvent, StageStatus
+from open_referee.pipeline.fit import FitPipeline
 from open_referee.pipeline.orchestrator import ReviewPipeline
-from open_referee.report.models import ReviewReport
+from open_referee.report.models import FitReport, ReviewReport
 
 SRC_DIR = Path(__file__).resolve().parent.parent.parent.parent
 TEMPLATES_DIR = SRC_DIR / "templates"
@@ -90,6 +91,9 @@ def create_app() -> FastAPI:
     async def start_review(
         paper: UploadFile = File(...),
         literature: list[UploadFile] = File(default=[]),
+        depth: str | None = Form(default=None),
+        budget: float | None = Form(default=None),
+        journal_profile: str | None = Form(default=None),
         cfg: Config = Depends(get_cfg),
     ):
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -102,7 +106,15 @@ def create_app() -> FastAPI:
                 p = UPLOAD_DIR / f"{run_id}_lit_{_safe_filename(lf.filename)}"
                 p.write_bytes(await lf.read())
                 lit_paths.append(p)
-        pipeline = ReviewPipeline(cfg, run_id=run_id)
+        if depth not in (None, "", "default", "auto", "fast", "standard", "deep"):
+            raise HTTPException(422, f"unknown depth '{depth}'")
+        pipeline = ReviewPipeline(
+            cfg,
+            run_id=run_id,
+            budget_usd=budget,
+            journal_profile=journal_profile,
+            depth=depth or None,
+        )
         application.state.pipelines[run_id] = pipeline
 
         def _cleanup(_task: asyncio.Task) -> None:
@@ -118,6 +130,34 @@ def create_app() -> FastAPI:
         application.state.pipelines[run_id + ":task"] = task  # keep a ref while running
         return {"run_id": run_id}
 
+    @application.post("/api/fit")
+    async def start_fit(
+        paper: UploadFile = File(...),
+        journal_profile: str = Form(default=""),
+        budget: float | None = Form(default=None),
+        cfg: Config = Depends(get_cfg),
+    ):
+        """Desk-reject estimator: one paper + free-form journal profile."""
+        if not journal_profile.strip():
+            raise HTTPException(422, "journal_profile is required for a fit estimate")
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        run_id = uuid.uuid4().hex[:12]
+        paper_path = UPLOAD_DIR / f"{run_id}_{_safe_filename(paper.filename)}"
+        paper_path.write_bytes(await paper.read())
+        pipeline = FitPipeline(cfg, run_id=run_id, budget_usd=budget)
+        application.state.pipelines[run_id] = pipeline
+
+        def _cleanup_fit(_task: asyncio.Task) -> None:
+            application.state.pipelines.pop(run_id + ":task", None)
+            _finished_tasks[run_id] = _task
+            while len(_finished_tasks) > _MAX_FINISHED_TASKS:
+                _finished_tasks.pop(next(iter(_finished_tasks)))
+
+        task = asyncio.create_task(_run_fit(pipeline, paper_path, journal_profile, run_id))
+        task.add_done_callback(_cleanup_fit)
+        application.state.pipelines[run_id + ":task"] = task
+        return {"run_id": run_id}
+
     async def _run_pipeline(pipeline, paper_path, lit_paths, run_id):
         try:
             await pipeline.run(paper_path, lit_paths)
@@ -125,6 +165,14 @@ def create_app() -> FastAPI:
             import logging
 
             logging.getLogger(__name__).exception("run %s failed", run_id)
+
+    async def _run_fit(pipeline, paper_path, journal_profile, run_id):
+        try:
+            await pipeline.run(paper_path, journal_profile)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("fit run %s failed", run_id)
 
     @application.get("/api/reviews/{run_id}/events")
     async def events(run_id: str):
@@ -194,7 +242,7 @@ def create_app() -> FastAPI:
         report = _load_report(run_id)
         if report is None:
             raise HTTPException(404, "report not ready")
-        if isinstance(report, ReviewReport):
+        if isinstance(report, (ReviewReport, FitReport)):
             report = report.model_dump(mode="json")
         return JSONResponse(report)
 
@@ -271,11 +319,15 @@ def create_app() -> FastAPI:
     return application
 
 
-def _load_report(run_id: str) -> dict | ReviewReport | None:
+def _load_report(run_id: str) -> dict | ReviewReport | FitReport | None:
     p = DEFAULT_CONFIG_DIR / "runs" / run_id / "report.json"
     if not p.exists():
         return None
-    return ReviewReport.model_validate_json(p.read_text())
+    raw = p.read_text()
+    try:
+        return ReviewReport.model_validate_json(raw)
+    except Exception:
+        return FitReport.model_validate_json(raw)
 
 
 def _config_from_form(form, base: Config) -> Config:
@@ -325,7 +377,7 @@ def _config_from_form(form, base: Config) -> Config:
         max_retries=base.llm.max_retries,
     )
     depth = s("review_depth", base.review.depth)
-    if depth in ("fast", "standard", "deep"):
+    if depth in ("fast", "standard", "deep", "auto"):
         base.review.depth = depth
     base.review.max_cost_usd = f("review_max_cost_usd", base.review.max_cost_usd)
     base.review.max_parallel_calls = i("review_max_parallel_calls", base.review.max_parallel_calls)

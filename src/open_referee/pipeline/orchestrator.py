@@ -1,9 +1,12 @@
 """The review pipeline orchestrator.
 
-Stages: ingest -> triage -> survey -> scout -> verify (parallel per section)
--> challenge (parallel per section) -> bibliography -> meta -> validate ->
-assemble. Every stage persists its artifact so a run resumes where it left
-off. LLM role resolution and budget enforcement flow through a RolePool.
+Stages: ingest -> triage -> claims -> survey -> scout -> verify (parallel
+per section/claim) -> challenge (parallel per section) -> bibliography ->
+meta -> validate -> assemble. Every stage persists its artifact so a run
+resumes where it left off. LLM role resolution and budget enforcement flow
+through a RolePool; budget planning, tracking and steering flow through a
+BudgetHarness (pipeline/budget.py) that owns the plan and charges every
+call — including the planner's own — to the same budget.
 """
 
 from __future__ import annotations
@@ -25,7 +28,17 @@ from open_referee.literature import (
     PeerReviewScout,
     SearchRouter,
 )
-from open_referee.pipeline import prompts
+from open_referee.pipeline import prompts, prompts_plan
+from open_referee.pipeline.budget import (
+    BudgetHarness,
+    BudgetInfeasible,
+    DocumentStats,
+    PlanKnobs,
+    PricingError,
+    RepairOption,
+    ReviewPlan,
+    Steering,
+)
 from open_referee.pipeline.state import RunState, Stage, StageEvent, StageStatus
 from open_referee.providers import (
     BudgetExceeded,
@@ -36,7 +49,7 @@ from open_referee.providers import (
     UsageLedger,
 )
 from open_referee.report import ReviewComment, ReviewReport
-from open_referee.report.models import UsageSummary
+from open_referee.report.models import PlanSummary, UsageSummary
 from open_referee.report.render import render_markdown, render_pdf
 
 logger = logging.getLogger(__name__)
@@ -61,12 +74,14 @@ class RolePool:
     ledger: UsageLedger
     providers: dict[ModelRole, ChatProvider] = field(default_factory=dict)
     specs: dict[ModelRole, ModelSpec] = field(default_factory=dict)
+    harness: BudgetHarness | None = None  # budget tracking back-reference
 
     @classmethod
-    def build(cls, cfg: Config, roles: set[ModelRole]) -> RolePool:
+    def build(cls, cfg: Config, roles: set[ModelRole], cap_usd: float | None = None) -> RolePool:
         from open_referee.providers.factory import build_provider
 
-        pool = cls(cfg=cfg, ledger=UsageLedger(cfg.review.max_cost_usd, cfg.llm.pricing))
+        cap = cap_usd if cap_usd is not None else cfg.review.max_cost_usd
+        pool = cls(cfg=cfg, ledger=UsageLedger(cap, cfg.llm.pricing))
         for role in roles:
             role_cfg = cfg.llm.role(role)
             pool.providers[role] = build_provider(cfg.llm, role_cfg)
@@ -84,7 +99,9 @@ class RolePool:
             )
         return pool
 
-    async def complete_json(self, role: ModelRole, system: str, user: str) -> dict:
+    async def complete_json(
+        self, role: ModelRole, system: str, user: str, call_type: str = "other"
+    ) -> dict:
         """JSON-mode completion with parse-repair retry, ledger check, usage record."""
         provider = self.providers[role]
         spec = self.specs[role]
@@ -98,7 +115,9 @@ class RolePool:
             ChatMessage(role="user", content=user),
         ]
         resp = await provider.complete(messages, json_mode=True)
-        await self.ledger.record(spec, role.value, resp)
+        rec = await self.ledger.record(spec, role.value, resp, call_type=call_type)
+        if self.harness is not None:
+            self.harness.note_record(rec)
         from open_referee.providers.adapters import extract_json
 
         try:
@@ -115,7 +134,9 @@ class RolePool:
                 ],
                 json_mode=True,
             )
-            await self.ledger.record(spec, role.value, resp2)
+            rec2 = await self.ledger.record(spec, role.value, resp2, call_type=call_type)
+            if self.harness is not None:
+                self.harness.note_record(rec2)
             return extract_json(resp2.text)
 
     async def close(self) -> None:
@@ -124,12 +145,29 @@ class RolePool:
 
 
 class ReviewPipeline:
-    def __init__(self, cfg: Config, run_id: str | None = None):
+    def __init__(
+        self,
+        cfg: Config,
+        run_id: str | None = None,
+        budget_usd: float | None = None,
+        journal_profile: str | None = None,
+        depth: str | None = None,
+    ):
         self.cfg = cfg
         self.run_id = run_id or uuid.uuid4().hex[:12]
+        self.requested_budget_usd = budget_usd
+        self.journal_profile = (journal_profile or "").strip() or None
+        self.requested_depth = (depth or cfg.review.depth).lower().strip()
         self.state: RunState | None = None
         self._subscribers: list[asyncio.Queue[StageEvent]] = []
         self._pool: RolePool | None = None
+        self._venue_block: str = ""
+        if self.journal_profile:
+            self._venue_block = (
+                "\n\n## Target venue profile (free-form, from the user)\n\n"
+                f"{self.journal_profile[:8000]}\n\n"
+                "Review with this venue's aims, scope and standards in mind.\n"
+            )
 
     # ---------------------------------------------------------------- events --
 
@@ -139,10 +177,20 @@ class ReviewPipeline:
         return q
 
     async def _emit(
-        self, stage: Stage, status: StageStatus, message: str = "", progress: float | None = None
+        self,
+        stage: Stage,
+        status: StageStatus,
+        message: str = "",
+        progress: float | None = None,
+        data: dict | None = None,
     ):
         ev = StageEvent(
-            run_id=self.run_id, stage=stage, status=status, message=message, progress=progress
+            run_id=self.run_id,
+            stage=stage,
+            status=status,
+            message=message,
+            progress=progress,
+            data=data or {},
         )
         for q in self._subscribers:
             await q.put(ev)
@@ -154,12 +202,12 @@ class ReviewPipeline:
     async def run(
         self, paper_path: str | Path, literature_paths: list[str | Path] | None = None
     ) -> ReviewReport:
-        state = RunState(
-            run_id=self.run_id,
-            paper_path=str(paper_path),
-            literature_paths=[str(p) for p in (literature_paths or [])],
-        )
+        state = self._load_or_create_state(paper_path, literature_paths)
         self.state = state
+        state.run_type = "review"
+        state.requested_depth = self.requested_depth
+        state.budget_usd = self.requested_budget_usd
+        state.journal_profile = self.journal_profile
         state.save()
         try:
             pool = await self._ensure_pool()
@@ -188,8 +236,13 @@ class ReviewPipeline:
             state.save()
             await self._emit(Stage.INGEST, StageStatus.DONE, doc.title)
 
+            # 1b. budget preflight + initial (deterministic) plan — free of LLM cost
+            await self._init_budget(pool, doc)
+
             # 2. triage
-            triage = await self._stage_or_resume(Stage.TRIAGE, lambda: self._triage(pool, doc))
+            triage = await self._stage_or_resume(
+                Stage.TRIAGE, lambda: self._triage(pool, doc), skip_key="triage"
+            )
             queries = triage.get("search_queries", [])[:8]
             key_citations = triage.get("key_citations", [])
 
@@ -197,6 +250,12 @@ class ReviewPipeline:
             claims = await self._stage_or_resume(
                 Stage.CLAIMS, lambda: self._claim_inventory(pool, doc, triage), skip_key="claims"
             )
+            # claims milestone: exact claim count is the dominant cost driver,
+            # so the (single) planner LLM call happens here, informed by reality
+            if pool.harness is not None:
+                pool.harness.stats.n_claims = len(claims) if claims else 0
+            if self._is_auto() and not state.stage_status(Stage.VERIFY) == StageStatus.DONE:
+                await self._plan_milestone(pool, "claims")
 
             # 3+4. literature survey + community scout (concurrent)
             pack = await self._stage_or_resume(
@@ -208,18 +267,20 @@ class ReviewPipeline:
                 Stage.SCOUT, lambda: self._scout(pool, doc.title, key_citations, pack)
             )
 
-            # 5. verify: per-claim workers + section lenses (by depth) + artifacts + whole-paper
+            # 5. verify: per-claim workers + section lenses (by plan) + artifacts + whole-paper
             candidates = await self._stage_or_resume(
                 Stage.VERIFY,
                 lambda: self._verify(pool, doc, pack, triage, claims),
                 skip_key="candidates",
             )
+            await self._budget_checkpoint(pool, Stage.VERIFY)
             # 6. challenge
             validated = await self._stage_or_resume(
                 Stage.CHALLENGE,
                 lambda: self._challenge(pool, doc, pack, candidates),
                 skip_key="validated",
             )
+            await self._budget_checkpoint(pool, Stage.CHALLENGE)
             # 7. bibliography
             bib = await self._stage_or_resume(
                 Stage.BIBLIOGRAPHY,
@@ -242,6 +303,14 @@ class ReviewPipeline:
             state.save()
             await self._emit(Stage.ASSEMBLE, StageStatus.DONE, "report ready")
             return report
+        except (PricingError, BudgetInfeasible) as e:
+            # pre-spend abort: no partial report is possible or meaningful
+            if state:
+                state.status = "failed"
+                state.error = str(e)
+                state.save()
+            await self._emit(Stage.ASSEMBLE, StageStatus.FAILED, f"cannot run: {e}")
+            raise
         except BudgetExceeded as e:
             # Drain gracefully: assemble a partial report from whatever the
             # pipeline managed to produce before the spend cap tripped.
@@ -287,6 +356,37 @@ class ReviewPipeline:
 
     # ---------------------------------------------------------------- helpers --
 
+    def _load_or_create_state(
+        self, paper_path: str | Path, literature_paths: list[str | Path] | None
+    ) -> RunState:
+        """Resume an interrupted run (same run_id) or start a fresh state."""
+        from open_referee.pipeline.state import _runs_dir
+
+        existing = _runs_dir() / self.run_id / "state.json"
+        if existing.exists():
+            try:
+                return RunState.load(self.run_id)
+            except Exception:
+                logger.warning("could not load state for %s; starting fresh", self.run_id)
+        return RunState(
+            run_id=self.run_id,
+            paper_path=str(paper_path),
+            literature_paths=[str(p) for p in (literature_paths or [])],
+        )
+
+    def _effective_depth(self) -> str:
+        if self.state is not None and self.state.requested_depth:
+            return self.state.requested_depth
+        return self.requested_depth
+
+    def _is_auto(self) -> bool:
+        return self._effective_depth() == "auto"
+
+    def _effective_budget(self) -> float:
+        if self.requested_budget_usd is not None:
+            return self.requested_budget_usd
+        return self.cfg.review.max_cost_usd
+
     async def _ensure_pool(self) -> RolePool:
         if self._pool is None:
             roles = {ModelRole.STRONG, ModelRole.SMALL}
@@ -295,8 +395,257 @@ class ReviewPipeline:
                 roles.add(ModelRole.VISION)
             except KeyError:
                 pass
-            self._pool = RolePool.build(self.cfg, roles)
+            self._pool = RolePool.build(self.cfg, roles, cap_usd=self._effective_budget())
         return self._pool
+
+    # ---------------------------------------------------------------- budget --
+
+    async def _init_budget(self, pool: RolePool, doc: Document) -> None:
+        """Preflight + initial deterministic plan (no LLM cost).
+
+        Auto mode: pricing must be configured (hard error) and the budget
+        must buy a meaningful minimum (hard error suggesting the minimum).
+        Preset modes: the harness still tracks spend against a deterministic
+        estimate of the preset so the live view works; pricing gaps warn.
+        """
+        harness = BudgetHarness(
+            self.cfg,
+            pool.ledger,
+            pool.specs,
+            budget_usd=self._effective_budget(),
+            auto=self._is_auto(),
+        )
+        harness.stats = DocumentStats.from_doc(doc)
+        pool.harness = harness
+        # resume: restore plan + spend accounting from persisted state
+        assert self.state is not None
+        if self.state.ledger_calls:
+            from open_referee.providers.usage import CallRecord
+
+            pool.ledger.calls = [CallRecord.model_validate(c) for c in self.state.ledger_calls]
+            for rec in pool.ledger.calls:
+                harness.note_record(rec)
+        if self.state.plan is not None:
+            try:
+                restored = ReviewPlan.model_validate(self.state.plan)
+                restored.budget_usd = self._effective_budget()
+                harness.set_plan(restored)
+            except Exception:
+                logger.warning("could not restore persisted plan; replanning")
+        if harness.plan is not None:
+            return
+        try:
+            harness.require_pricing()
+        except PricingError as e:
+            if self._is_auto():
+                raise
+            logger.warning("pricing incomplete, budget tracking degraded: %s", e)
+        if self._is_auto():
+            plan = harness.deterministic_plan(reason="preflight")
+            harness.set_plan(plan)
+            await self._emit_plan_event("plan v0 (deterministic preflight)", plan)
+        else:
+            depth = self._effective_depth()
+            knobs = PlanKnobs.from_preset(self.cfg.review.depth_preset())
+            plan = harness.preset_plan(knobs, depth)
+            harness.set_plan(plan)
+            await self._emit_plan_event(f"tracking preset '{depth}' spend", plan)
+        self._sync_budget_to_state()
+        self.state.save()
+
+    async def _emit_plan_event(self, message: str, plan: ReviewPlan) -> None:
+        st = self._pool.harness.status() if self._pool and self._pool.harness else {}
+        await self._emit(
+            Stage.PLAN,
+            StageStatus.RUNNING,
+            message,
+            data={"plan": plan.model_dump(mode="json"), "budget": st},
+        )
+
+    async def _plan_milestone(self, pool: RolePool, milestone: str) -> None:
+        """The single baseline planner LLM call (auto mode), informed by the
+        milestone data (claim count). Falls back to the deterministic plan."""
+        harness = pool.harness
+        if harness is None or harness.plan is None:
+            return
+        briefing = harness.briefing()
+        try:
+            res = await pool.complete_json(
+                ModelRole.SMALL,
+                prompts_plan.PLANNER_SYSTEM,
+                prompts_plan.planner_user(briefing),
+                call_type="planner",
+            )
+        except (LLMError, BudgetExceeded, json.JSONDecodeError) as e:
+            logger.warning("planner call failed (%s); deterministic plan kept", e)
+            res = {}
+        harness.plan.planner_calls_used += 1
+        plan = self._planner_response_to_plan(harness, res, milestone)
+        harness.set_plan(plan)
+        await self._emit(
+            Stage.PLAN,
+            StageStatus.RUNNING,
+            f"plan v{plan.plan_version} ({milestone} milestone): target "
+            f"${plan.target_usd:.2f} of ${plan.budget_usd:.2f}",
+            data={"plan": plan.model_dump(mode="json"), "budget": harness.status()},
+        )
+        self._sync_budget_to_state()
+        self.state.save()
+
+    def _planner_response_to_plan(
+        self, harness: BudgetHarness, res: dict, source: str
+    ) -> ReviewPlan:
+        assert harness.plan is not None
+        action = str(res.get("action", "")).lower()
+        knobs_dict = res.get("knobs")
+        if action == "plan" and isinstance(knobs_dict, dict):
+            try:
+                knobs = PlanKnobs.model_validate(knobs_dict)
+            except Exception:
+                knobs = harness.plan.knobs
+            candidate = harness.plan.model_copy(
+                update={
+                    "knobs": knobs,
+                    "rationale": str(res.get("rationale", ""))[:1000] or harness.plan.rationale,
+                    "planner_calls_used": harness.plan.planner_calls_used,
+                }
+            )
+            return harness.validate_plan(candidate, source="planner")
+        # noop / unrecognized: keep the deterministic plan, note the rationale
+        from open_referee.pipeline.budget import PlanAdjustment
+
+        return harness.plan.model_copy(
+            update={
+                "adjustments": harness.plan.adjustments
+                + [
+                    PlanAdjustment(
+                        reason=source,
+                        action="keep-plan",
+                        detail=str(res.get("action") or "no valid reply")[:200],
+                        source="planner",
+                    )
+                ]
+            }
+        )
+
+    async def _budget_checkpoint(self, pool: RolePool, finished_stage: Stage) -> None:
+        """Stage-boundary steering: deterministic first, planner LLM only for
+        genuine multi-option judgment calls (throttled by the harness)."""
+        harness = pool.harness
+        if harness is None or harness.plan is None:
+            return
+        reason = harness.should_replan()
+        st = harness.status()
+        if reason is None:
+            await self._emit(
+                Stage.PLAN,
+                StageStatus.RUNNING,
+                f"budget after {finished_stage.value}: ${st['actual_usd']:.2f} spent, "
+                f"${st['projected_final_usd']:.2f} projected of ${st['budget_usd']:.2f}",
+                data={"budget": st},
+            )
+            self._sync_budget_to_state()
+            return
+        steering: Steering = harness.steer()
+        if steering.action == "none":
+            return
+        if steering.action == "applied" and steering.applied is not None:
+            plan = harness.apply_option(steering.applied, reason=reason)
+            harness.set_plan(plan)
+            await self._emit(
+                Stage.PLAN,
+                StageStatus.RUNNING,
+                f"budget steering: {steering.applied.label} (saves "
+                f"${steering.applied.saves_usd:.2f}) — {reason}",
+                data={"plan": plan.model_dump(mode="json"), "budget": harness.status()},
+            )
+        elif steering.action == "needs_planner" and steering.options:
+            plan = await self._planner_choose(pool, steering.options, reason)
+            await self._emit(
+                Stage.PLAN,
+                StageStatus.RUNNING,
+                f"plan v{plan.plan_version} adjusted by planner — {reason}",
+                data={"plan": plan.model_dump(mode="json"), "budget": harness.status()},
+            )
+        else:  # cant_fix: per-call gating + hard cap take over
+            await self._emit(
+                Stage.PLAN,
+                StageStatus.RUNNING,
+                f"budget warning: {steering.note}",
+                data={"budget": harness.status()},
+            )
+        self._sync_budget_to_state()
+        self.state.save()
+
+    async def _planner_choose(
+        self, pool: RolePool, options: list[RepairOption], reason: str
+    ) -> ReviewPlan:
+        harness = pool.harness
+        assert harness is not None and harness.plan is not None
+        briefing = harness.briefing(options=options)
+        chosen: RepairOption | None = None
+        try:
+            res = await pool.complete_json(
+                ModelRole.SMALL,
+                prompts_plan.PLANNER_SYSTEM,
+                prompts_plan.planner_user(briefing),
+                call_type="planner",
+            )
+            idx = res.get("option_index")
+            if isinstance(idx, int) and 0 <= idx < len(options):
+                chosen = options[idx]
+        except (LLMError, BudgetExceeded, json.JSONDecodeError) as e:
+            logger.warning("planner choice failed (%s); taking largest savings", e)
+        harness.plan.planner_calls_used += 1
+        if chosen is None:
+            chosen = options[0]  # largest projected savings (sorted desc)
+        plan = harness.apply_option(chosen, reason=reason, source="planner")
+        harness.set_plan(plan)
+        return plan
+
+    def _sync_budget_to_state(self) -> None:
+        """Persist plan + ledger so a resumed run keeps spend accounting."""
+        if self.state is None or self._pool is None:
+            return
+        h = self._pool.harness
+        if h is not None:
+            self.state.plan = h.plan.model_dump(mode="json") if h.plan else None
+            self.state.ledger_calls = [c.model_dump(mode="json") for c in h.ledger.calls]
+
+    # --------------------------------------------------------- plan knobs --
+
+    def plan_knobs(self) -> PlanKnobs:
+        """Current plan knobs (harness plan if present, else depth preset)."""
+        pool = getattr(self, "_pool", None)
+        if pool is not None and pool.harness is not None:
+            plan = pool.harness.plan
+            if plan is not None:
+                return plan.knobs
+        return PlanKnobs.from_preset(self.cfg.review.depth_preset())
+
+    def budget_allows(self, call_type: str) -> bool:
+        """Fan-out gate: keeps the projection under the hard budget."""
+        pool = getattr(self, "_pool", None)
+        if pool is None or pool.harness is None:
+            return True
+        return pool.harness.allow_call(call_type)
+
+    def _note_gate_stop(self, call_type: str) -> None:
+        """Record + announce (once per call type) that the budget gate tripped."""
+        pool = getattr(self, "_pool", None)
+        if pool is None or pool.harness is None:
+            return
+        h = pool.harness
+        first = call_type not in h.gate_stopped
+        h.note_gate_stop(call_type, 1)
+        if first:
+            st = h.status()
+            logger.info(
+                "budget gate stopped %s (projected $%.2f of $%.2f)",
+                call_type,
+                st["projected_final_usd"],
+                st["budget_usd"],
+            )
 
     async def _stage_or_resume(self, stage: Stage, coro_fn, skip_key: str | None = None):
         assert self.state is not None, "run() must be invoked first"
@@ -316,6 +665,7 @@ class ReviewPipeline:
         self.state.set_stage(stage, StageStatus.DONE)
         if skip_key:
             self.state.artifacts[skip_key] = result
+        self._sync_budget_to_state()
         self.state.save()
         await self._emit(stage, StageStatus.DONE, progress=1.0)
         return result
@@ -331,9 +681,43 @@ class ReviewPipeline:
 
     # ----------------------------------------------------------------- stages --
 
+    def _build_plan_summary(self) -> PlanSummary | None:
+        """Telemetry for the report: how the run was budgeted vs actual."""
+        if self._pool is None or self._pool.harness is None:
+            return None
+        h = self._pool.harness
+        st = h.status()
+        notes: list[str] = []
+        for ct, skipped in sorted(h.gate_stopped.items()):
+            notes.append(f"{ct}: {skipped} unit(s) skipped by the budget gate")
+        plan = h.plan
+        return PlanSummary(
+            mode="auto" if self._is_auto() else self._effective_depth(),
+            budget_usd=st["budget_usd"],
+            target_usd=st["target_usd"],
+            planned_usd=st["planned_usd"],
+            spent_usd=st["actual_usd"],
+            control_spent_usd=st["control_actual_usd"],
+            projected_final_usd=st["projected_final_usd"],
+            planner_calls_used=st["planner_calls_used"],
+            adjustments=[
+                f"[{a.source}] {a.action}: {a.detail or a.reason}"
+                for a in (plan.adjustments if plan else [])
+            ],
+            notes="; ".join(notes) or None,
+        )
+
     async def _triage(self, pool: RolePool, doc: Document) -> dict:
-        user = prompts.TRIAGE_USER.format(title=doc.title, manuscript=self._manuscript_trunc(doc))
-        return await pool.complete_json(ModelRole.STRONG, prompts.TRIAGE_SYSTEM, user)
+        user = (
+            prompts.TRIAGE_USER.format(title=doc.title, manuscript=self._manuscript_trunc(doc))
+            + self._venue_block
+        )
+        triage = await pool.complete_json(
+            ModelRole.STRONG, prompts.TRIAGE_SYSTEM, user, call_type="triage"
+        )
+        if pool.harness is not None:
+            pool.harness.stats.n_lenses = len(self._lenses_for(triage))
+        return triage
 
     async def _claim_inventory(self, pool: RolePool, doc: Document, triage: dict) -> list[dict]:
         from open_referee.pipeline.claims import run_claim_inventory
@@ -383,7 +767,10 @@ class ReviewPipeline:
             # the client contexts so Crossref lookups below remain valid
             try:
                 survey = await pool.complete_json(
-                    ModelRole.SMALL, prompts.SURVEY_SYSTEM, pack.render(max_items=30)
+                    ModelRole.SMALL,
+                    prompts.SURVEY_SYSTEM,
+                    pack.render(max_items=30),
+                    call_type="surveyor",
                 )
                 for sel in survey.get("selected", []):
                     idx = sel.get("index")
@@ -456,7 +843,7 @@ class ReviewPipeline:
     ) -> list[dict]:
         from open_referee.pipeline.claims import verify_artifacts, verify_claims
 
-        preset = self.cfg.review.depth_preset()
+        knobs = self.plan_knobs()
         candidates: list[dict] = []
 
         # per-claim verification workers (the primary engine)
@@ -465,18 +852,23 @@ class ReviewPipeline:
             candidates.extend(await verify_claims(self, pool, doc, claims, self.cfg))
 
         sections = self._reviewable_sections(doc)
-        lenses = self._lenses_for(triage) if preset.per_section_lenses else []
+        lenses = self._lenses_for(triage) if knobs.per_section_lenses else []
         sem = asyncio.Semaphore(self.cfg.review.max_parallel_calls)
 
         async def run_lens_section(lens_name: str, system: str, title: str, text: str):
             async with sem:
+                if not self.budget_allows("lens_section"):
+                    self._note_gate_stop("lens_section")
+                    return []
                 user = prompts.VERIFIER_USER.format(
                     section_title=f"{title} — {lens_name} lens",
                     context_block=self._pack_for_section(pack),
                     section_text=text[:40_000],
                 )
                 try:
-                    res = await pool.complete_json(ModelRole.SMALL, system, user)
+                    res = await pool.complete_json(
+                        ModelRole.SMALL, system, user, call_type="lens_section"
+                    )
                 except LLMError as e:
                     logger.warning("verifier (%s) failed on section %s: %s", lens_name, title, e)
                     return []
@@ -501,7 +893,7 @@ class ReviewPipeline:
             candidates.extend(art_comments)
 
         # whole-paper pass: cross-section coherence (strong model, full text)
-        if not preset.whole_paper_passes:
+        if not knobs.whole_paper_passes:
             return candidates
         try:
             await self._emit(Stage.VERIFY, StageStatus.RUNNING, "whole-paper coherence pass")
@@ -509,7 +901,10 @@ class ReviewPipeline:
                 title=doc.title, manuscript=self._manuscript_trunc(doc)
             )
             wp = await pool.complete_json(
-                ModelRole.STRONG, prompts.WHOLE_PAPER_VERIFIER_SYSTEM, wp_user
+                ModelRole.STRONG,
+                prompts.WHOLE_PAPER_VERIFIER_SYSTEM,
+                wp_user,
+                call_type="whole_paper_verify",
             )
             candidates.extend(wp.get("comments", []))
             await self._emit(
@@ -533,15 +928,21 @@ class ReviewPipeline:
                     for c in candidates
                     if c.get("paragraph_anchor", "") and _anchor_in(c["paragraph_anchor"], text)
                 ]
-                user = prompts.CHALLENGER_USER.format(
-                    section_title=title,
-                    context_block=self._pack_for_section(pack),
-                    section_text=text[:40_000],
-                    candidates_json=json.dumps(cands, indent=1)[:20_000],
+                user = (
+                    prompts.CHALLENGER_USER.format(
+                        section_title=title,
+                        context_block=self._pack_for_section(pack),
+                        section_text=text[:40_000],
+                        candidates_json=json.dumps(cands, indent=1)[:20_000],
+                    )
+                    + self._venue_block
                 )
                 try:
                     res = await pool.complete_json(
-                        ModelRole.STRONG, prompts.CHALLENGER_SYSTEM, user
+                        ModelRole.STRONG,
+                        prompts.CHALLENGER_SYSTEM,
+                        user,
+                        call_type="section_challenger",
                     )
                 except LLMError as e:
                     logger.warning("challenger failed on %s: %s", title, e)
@@ -569,13 +970,19 @@ class ReviewPipeline:
                 if isinstance(c, dict) and _norm(c.get("paragraph_anchor", ""))[:120] not in claimed
             ]
             await self._emit(Stage.CHALLENGE, StageStatus.RUNNING, "whole-paper challenge")
-            wp_user = prompts.WHOLE_PAPER_CHALLENGER_USER.format(
-                title=doc.title,
-                manuscript=self._manuscript_trunc(doc),
-                candidates_json=json.dumps(wp_candidates, indent=1)[:30_000],
+            wp_user = (
+                prompts.WHOLE_PAPER_CHALLENGER_USER.format(
+                    title=doc.title,
+                    manuscript=self._manuscript_trunc(doc),
+                    candidates_json=json.dumps(wp_candidates, indent=1)[:30_000],
+                )
+                + self._venue_block
             )
             wp = await pool.complete_json(
-                ModelRole.STRONG, prompts.WHOLE_PAPER_CHALLENGER_SYSTEM, wp_user
+                ModelRole.STRONG,
+                prompts.WHOLE_PAPER_CHALLENGER_SYSTEM,
+                wp_user,
+                call_type="whole_paper_challenge",
             )
             kept = [c for c in wp.get("validated", []) if c.get("verdict") != "dropped"]
             validated.extend(kept + wp.get("new_comments", []))
@@ -604,7 +1011,9 @@ class ReviewPipeline:
             context=pack.render(max_items=25),
         )
         try:
-            result = await pool.complete_json(ModelRole.SMALL, prompts.BIBLIOGRAPHY_SYSTEM, user)
+            result = await pool.complete_json(
+                ModelRole.SMALL, prompts.BIBLIOGRAPHY_SYSTEM, user, call_type="bibliography"
+            )
             result.setdefault("in_text_issues", [])
             return result
         except LLMError as e:
@@ -616,23 +1025,33 @@ class ReviewPipeline:
             "entries": bib.get("entries", []),
             "in_text_issues": bib.get("in_text_issues", []),
         }
-        user = prompts.META_USER.format(
-            title=doc.title,
-            triage_json=json.dumps(triage)[:4000],
-            comments_json=json.dumps(validated, indent=1)[:60_000],
-            bib_summary=json.dumps(bib_summary)[:8000],
-            sota_notes=(pack.field_hint or "")[:1500],
+        user = (
+            prompts.META_USER.format(
+                title=doc.title,
+                triage_json=json.dumps(triage)[:4000],
+                comments_json=json.dumps(validated, indent=1)[:60_000],
+                bib_summary=json.dumps(bib_summary)[:8000],
+                sota_notes=(pack.field_hint or "")[:1500],
+            )
+            + self._venue_block
         )
-        return await pool.complete_json(ModelRole.STRONG, prompts.META_SYSTEM, user)
+        return await pool.complete_json(
+            ModelRole.STRONG, prompts.META_SYSTEM, user, call_type="meta"
+        )
 
     async def _validate(self, pool, doc, draft: dict) -> dict:
-        user = prompts.VALIDATOR_USER.format(
-            title=doc.title,
-            manuscript=self._manuscript_trunc(doc),
-            comments_json=json.dumps(draft.get("comments", []), indent=1)[:60_000],
-            overall=draft.get("overall_feedback", "")[:20_000],
+        user = (
+            prompts.VALIDATOR_USER.format(
+                title=doc.title,
+                manuscript=self._manuscript_trunc(doc),
+                comments_json=json.dumps(draft.get("comments", []), indent=1)[:60_000],
+                overall=draft.get("overall_feedback", "")[:20_000],
+            )
+            + self._venue_block
         )
-        result = await pool.complete_json(ModelRole.STRONG, prompts.VALIDATOR_SYSTEM, user)
+        result = await pool.complete_json(
+            ModelRole.STRONG, prompts.VALIDATOR_SYSTEM, user, call_type="validate"
+        )
         # merge any fields the validator omitted from the draft
         result.setdefault("paper_summary", draft.get("paper_summary", ""))
         result.setdefault("overall_feedback", draft.get("overall_feedback", ""))
@@ -671,6 +1090,7 @@ class ReviewPipeline:
             total_input_tokens=int(u.total_tokens()[0]) if u else 0,
             total_output_tokens=int(u.total_tokens()[1]) if u else 0,
         )
+        plan_summary = self._build_plan_summary()
         report = ReviewReport(
             run_id=self.run_id,
             paper_title=doc.title,
@@ -683,6 +1103,7 @@ class ReviewPipeline:
                 for r, p in (self._pool.specs if self._pool else {}).items()
             },
             validator_notes=final.get("validator_notes"),
+            plan_summary=plan_summary,
         )
         # persist report + exports into the run dir
         rdir = _runs_dir() / self.run_id

@@ -83,12 +83,14 @@
         <h2>Budget &amp; depth</h2>
         <label>Review depth
           <select name="review_depth">
-            {% for d in ['fast','standard','deep'] %}
+            {% for d in ['fast','standard','deep','auto'] %}
             <option value="{{ d }}" {% if cfg.review.depth == d %}selected{% endif %}>{{ d }}</option>
             {% endfor %}
           </select>
         </label>
-        <p class="muted small">fast: claim-lite, no lenses/defense · standard: balanced · deep: up to 150 claims, all passes</p>
+        <p class="muted small">fast: claim-lite, no lenses/defense · standard: balanced · deep: up to 150 claims, all passes ·
+          <strong>auto</strong>: budget-driven — a planner designs the run to fit the budget (requires
+          <code>llm.pricing</code> entries for every configured model)</p>
         <label>Max cost per review (USD) <input name="review_max_cost_usd" type="number" step="0.5" value="{{ cfg.review.max_cost_usd }}"></label>
         <label>Max parallel LLM calls <input name="review_max_parallel_calls" type="number" value="{{ cfg.review.max_parallel_calls }}"></label>
       </section>

@@ -91,7 +91,7 @@ async def test_literature_surveyor_crossref_stays_open(monkeypatch):
     monkeypatch.setattr(CrossrefClient, "lookup", spy_lookup)
 
     class FakePool:
-        async def complete_json(self, role, system, user):
+        async def complete_json(self, role, system, user, call_type="other"):
             return {
                 "selected": [],
                 "state_of_the_art_notes": "n/a",

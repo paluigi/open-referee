@@ -33,10 +33,26 @@ configure, and the full pipeline is inspectable.
   unverifiable comments before delivery
 - **Depth presets** — `fast` / `standard` / `deep` (deep ≈ up to 150 claim
   verifications + every artifact + full defense rounds)
+- **Budget-driven mode (`auto`)** — set a budget and a planner designs the
+  review to fit it: upfront feasibility check (aborts with a suggested
+  minimum budget when a meaningful review is not affordable), a cost model
+  per pipeline step, live spend-vs-plan tracking with adaptive estimates,
+  and deterministic steering (LLM replanning only for genuine judgment
+  calls — and the planner's own calls are charged to the same budget)
+- **Desk-reject estimator** — a second product: describe a journal (aim,
+  scope, metrics, institutional considerations — free-form) and get the
+  probability of passing the desk screen, from evidence-grounded factor
+  scores plus a transparent calibrated decision model
 - **Cost control** — per-call usage ledger, cost estimation from a pricing
-  table, hard spend cap per review
+  table, hard spend cap per review (pricing entries are **required** in
+  `auto` mode and for the fit estimate; local models can be priced at `0.0`)
+- **Attribution & metadata** — every report (review and fit) carries a
+  build-metadata table (model, calls, in/out tokens, cost per role), the
+  budget story (planned vs spent, adjustments), and a
+  *built with open-referee* link
 - **PWA** — installable web app (htmx + Alpine, no build step), live SSE
-  progress, resumable runs, JSON/Markdown/**PDF** report export
+  progress with a budget panel, resumable runs, JSON/Markdown/**PDF** report
+  export
 
 ## Quickstart
 
@@ -75,6 +91,11 @@ review:
   max_cost_usd: 10.0
 ```
 
+For budget-driven mode (`depth: auto`) and the desk-reject estimator, every
+configured model needs a price under `llm.pricing` — the run fails fast with
+the exact YAML to add otherwise. An explicit `0.0` entry counts as priced
+(local models).
+
 ## How a review runs
 
 | Stage | Role | What it does |
@@ -94,14 +115,52 @@ review:
 | **Review validator** | strong | final gate: quotes verified, severities recalibrated |
 | Assembler | — | anchor resolution (fuzzy + confidence), exports |
 
-Interrupted runs resume from `~/.open-referee/runs/<id>/` — stage artifacts
-are persisted after every step.
+Interrupted runs resume from `~/.open-referee/runs/<id>/` — stage artifacts,
+the budget plan, and the full spend ledger are persisted after every step.
+
+### Budget-driven mode (`auto`)
+
+Pick `auto` on the review form (or in settings) and set a budget. The run
+then works like this:
+
+1. **Preflight (free)** — after ingestion, a cost model built from document
+   statistics and your `llm.pricing` table checks feasibility. If the budget
+   cannot buy a meaningful minimum (control calls + 6 central claim
+   verifications + core synthesis), the run aborts immediately and suggests
+   the minimum — and what a standard-quality review would cost.
+2. **Plan v0 (deterministic, free)** — a greedy quality ordering produces a
+   starting plan; the budget is a hard ceiling and the plan target is soft.
+3. **Planner call (budgeted)** — after the claim inventory, one cheap
+   planner LLM call designs the strategy with full knowledge of the actual
+   claim count. Simple papers get cheap plans — a planner may target $25 of
+   a $100 budget, and that is respected (no spending money just because it
+   is available). Its output is validated and repaired deterministically;
+   LLM arithmetic is never trusted.
+4. **Tracking + steering** — every call (including triage, the claim
+   inventory, and the planner itself) is charged to the budget. Unit costs
+   adapt to observed reality. At stage boundaries the harness steers
+   deterministically (a forced repair applies without any LLM call); only
+   genuine multi-option judgment calls go back to the planner, throttled to
+   a small reserve. Fan-out loops gate per call, so claim verification
+   degrades gracefully (importance-first) instead of crashing into the cap.
+
+### Desk-reject estimator
+
+The *Journal fit estimate* card takes a paper plus a free-form venue
+profile — anything from a journal's aims-and-scope to a working-paper
+collection's institutional considerations. One strong-model call produces
+six evidence-grounded factor scores (scope fit, aim alignment,
+methods/format fit, novelty threshold, presentation readiness,
+policy/ethics); a transparent weighted-logistic calibration (weights
+printed in the report) maps them to the probability of *not* being desk
+rejected. The same profile can optionally be attached to a full review as
+venue context.
 
 ## Development
 
 ```bash
 uv sync --extra dev
-uv run pytest -q        # 45 tests incl. full-pipeline e2e + regression suite
+uv run pytest -q        # 114 tests: budget/fit units + pipeline e2e + regressions
 uv run ruff check src tests
 uv run black --check src tests
 ```

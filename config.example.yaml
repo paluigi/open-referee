@@ -24,10 +24,14 @@ llm:
     strong:   {provider: openrouter, model: anthropic/claude-sonnet-4.5}
     small:    {provider: ollama,    model: llama3.1:8b}
     vision:   {provider: gemini,    model: gemini-2.5-flash}
-  # Optional price table for cost estimation: "<provider>/<model>":
+  # Price table for cost estimation: "<provider>/<model>":
   #   {input_per_mtok: USD, output_per_mtok: USD}
+  # REQUIRED for budget-driven mode (review.depth: auto) and the journal-fit
+  # estimate: runs fail fast listing any unpriced model. An explicit 0.0
+  # entry counts as priced (local models are free).
   pricing:
     openrouter/anthropic/claude-sonnet-4.5: {input_per_mtok: 3.0, output_per_mtok: 15.0}
+    ollama/llama3.1:8b:                     {input_per_mtok: 0.0, output_per_mtok: 0.0}
     gemini/gemini-2.5-flash:                {input_per_mtok: 0.30, output_per_mtok: 2.5}
   request_timeout_s: 300
   max_retries: 3
@@ -55,6 +59,9 @@ review:
   max_cost_usd: 10.0
   max_parallel_calls: 8
   max_user_literature_docs: 10
+  # fast | standard | deep | auto (auto = budget-driven planner; the per-run
+  # depth + budget selectors on the home page override this)
+  depth: standard
 
 server:
   host: 127.0.0.1

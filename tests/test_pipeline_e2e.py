@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from conftest import overall_json, triage_json, validator_json
 from open_referee.config import ModelRole
 from open_referee.pipeline import Stage, StageStatus
@@ -208,3 +210,274 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
         Stage.META,
         Stage.VALIDATE,
     } <= stages_seen
+
+
+async def test_auto_mode_budget_driven_e2e(test_config, sample_paper_file, monkeypatch, tmp_path):
+    """Auto (budget-driven) mode: deterministic preflight plan -> one planner
+    LLM call after the claims milestone -> validated knobs drive the run; the
+    planner call itself is budgeted and appears in usage."""
+
+    home = tmp_path / "home"
+    runs_dir = home / "runs"
+    import open_referee.config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG_DIR", home)
+    monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG_PATH", home / "config.yaml")
+    test_config.review.depth = "auto"
+    test_config.llm.pricing = {
+        "fake/strong-fake": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
+        "fake/small-fake": {"input_per_mtok": 0.3, "output_per_mtok": 2.5},
+    }
+
+    async def _fake_literature(self, pool, doc, triage, queries, key_citations, lit_docs):
+        from open_referee.literature import ContextPack
+
+        pack = ContextPack(paper_title=doc.title, field_hint="network science")
+        pack.user_docs = []
+        return pack
+
+    async def _fake_scout(self, pool, title, key_citations, pack):
+        return None
+
+    async def _fake_bib(self, pool, doc, pack):
+        return {"entries": [], "missing_key_references": []}
+
+    monkeypatch.setattr(ReviewPipeline, "_literature", _fake_literature)
+    monkeypatch.setattr(ReviewPipeline, "_scout", _fake_scout)
+    monkeypatch.setattr(ReviewPipeline, "_bibliography", _fake_bib)
+
+    pipeline = ReviewPipeline(test_config, run_id="auto01")
+    pool = await pipeline._ensure_pool()
+    strong = pool.providers[ModelRole.STRONG]
+    small = pool.providers[ModelRole.SMALL]
+
+    doc = await __import__("asyncio").to_thread(
+        __import__("open_referee.ingestion.readers", fromlist=["ingest_document"]).ingest_document,
+        sample_paper_file,
+    )
+    sections = pipeline._reviewable_sections(doc)
+    triage = json.loads(triage_json())
+    lenses = pipeline._lenses_for(triage)
+    n_verify = len(sections) * len(lenses)
+    n_sections = len(sections)
+
+    # control plane first
+    strong.queue(triage_json())  # triage
+    strong.queue(  # claim inventory
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "id": "cl01",
+                        "type": "theorem_proof",
+                        "importance": "central",
+                        "components": {
+                            "statement": "Theorem 1. Every widget network is stable.",
+                            "proof": "(none given)",
+                        },
+                        "anchor": "Theorem 1. Every widget network is stable.",
+                        "section": "3. Main result",
+                    }
+                ]
+            }
+        )
+    )
+    small.queue(  # the planner LLM call (after claims milestone)
+        json.dumps(
+            {
+                "action": "plan",
+                "knobs": {
+                    "max_claims": 5,
+                    "per_section_lenses": True,
+                    "whole_paper_passes": True,
+                    "defense_round": True,
+                    "max_artifacts": 0,
+                },
+                "target_usd": 0.5,
+                "rationale": "Small theory paper; lean claim-focused plan suffices.",
+            }
+        )
+    )
+    small.queue(  # surveyor
+        json.dumps({"selected": [], "state_of_the_art_notes": "n/a", "missing_references": []})
+    )
+    strong.queue(_script_comments("claim"))  # per-claim worker
+    for _ in range(n_verify):
+        small.queue(_script_comments("lens"))
+    strong.queue(_script_comments("whole-paper"))  # whole-paper verify pass
+    for title, _ in sections:
+        strong.queue(_script_challenge(title))
+    strong.queue(_script_challenge("whole-paper"))
+    n_defended = n_sections * 2 + 1 + 1
+    for i in range(n_defended):
+        small.queue(json.dumps({"defense": "weak", "defense_strength": "weak"}))
+        strong.queue(
+            json.dumps(
+                {
+                    "verdict": "upheld",
+                    "reason": "ok",
+                    "comment": {
+                        "title": f"upheld-{i}",
+                        "paragraph_anchor": "Theorem 1. Every widget network is stable.",
+                        "quote": "Every widget network is stable",
+                        "message": "State and prove the theorem or cite a source.",
+                        "score": 0.75,
+                        "category": "math",
+                    },
+                }
+            )
+        )
+    strong.queue(overall_json())
+    strong.queue(validator_json())
+
+    report = await pipeline.run(sample_paper_file)
+
+    # budget-mode assertions
+    assert report.plan_summary is not None
+    assert report.plan_summary.mode == "auto"
+    assert report.plan_summary.budget_usd == 100.0
+    assert report.plan_summary.spent_usd > 0
+    assert report.plan_summary.planner_calls_used >= 1
+    # the planner call itself is budgeted: it flows through the ledger (small)
+    assert pipeline._pool.harness.done.get("planner", 0) >= 1
+
+    # plan events were emitted for the live view
+    plan_events = [ev for ev in pipeline.state.events if ev.stage is Stage.PLAN]
+    assert plan_events, "expected Stage.PLAN events"
+    assert any(ev.data.get("plan") for ev in plan_events)
+    assert any(ev.data.get("budget") for ev in plan_events)
+
+    # the validated plan knobs drove the run (planner's claim trim survived)
+    h = pipeline._pool.harness
+    assert h.plan.knobs.max_claims == 5
+    assert h.plan.planned_cost() <= h.budget_usd
+
+    # state persisted plan + ledger for resume accounting
+    state = __import__("open_referee.pipeline.state", fromlist=["RunState"]).RunState.load(
+        "auto01", runs_dir=runs_dir
+    )
+    assert state.status == "completed"
+    assert state.plan is not None and state.plan["knobs"]["max_claims"] == 5
+    assert state.ledger_calls, "ledger calls should persist for resume"
+    planner_calls = [c for c in state.ledger_calls if c["call_type"] == "planner"]
+    assert planner_calls, "planner call must be charged to the budget"
+
+    # rendered report carries build metadata + attribution
+    md = (runs_dir / "auto01" / "report.md").read_text()
+    assert "## Build metadata" in md
+    assert "Built with [open-referee](https://github.com/paluigi/open-referee)" in md
+    assert "$" in md
+
+
+async def test_resume_restores_spend_accounting(
+    test_config, sample_paper_file, monkeypatch, tmp_path
+):
+    """A re-run with the same run_id resumes completed stages and restores
+    the ledger from persisted call records (no fresh-ledger reset)."""
+
+    home = tmp_path / "home"
+    import open_referee.config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG_DIR", home)
+    monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG_PATH", home / "config.yaml")
+    test_config.review.depth = "auto"
+    test_config.llm.pricing = {
+        "fake/strong-fake": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
+        "fake/small-fake": {"input_per_mtok": 0.3, "output_per_mtok": 2.5},
+    }
+
+    async def _fake_literature(self, pool, doc, triage, queries, key_citations, lit_docs):
+        from open_referee.literature import ContextPack
+
+        pack = ContextPack(paper_title=doc.title, field_hint="network science")
+        return pack
+
+    async def _fake_scout(self, pool, title, key_citations, pack):
+        return None
+
+    async def _fake_bib(self, pool, doc, pack):
+        return {"entries": [], "missing_key_references": []}
+
+    monkeypatch.setattr(ReviewPipeline, "_literature", _fake_literature)
+    monkeypatch.setattr(ReviewPipeline, "_scout", _fake_scout)
+    monkeypatch.setattr(ReviewPipeline, "_bibliography", _fake_bib)
+
+    # first run: reuse the scripted queue from the auto e2e by running it with
+    # a planner noop response
+    pipeline = ReviewPipeline(test_config, run_id="resume01")
+    pool = await pipeline._ensure_pool()
+    strong = pool.providers[ModelRole.STRONG]
+    small = pool.providers[ModelRole.SMALL]
+
+    doc = await __import__("asyncio").to_thread(
+        __import__("open_referee.ingestion.readers", fromlist=["ingest_document"]).ingest_document,
+        sample_paper_file,
+    )
+    sections = pipeline._reviewable_sections(doc)
+    triage = json.loads(triage_json())
+    lenses = pipeline._lenses_for(triage)
+    n_verify = len(sections) * len(lenses)
+    n_sections = len(sections)
+
+    strong.queue(triage_json())
+    strong.queue(
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "id": "cl01",
+                        "type": "theorem_proof",
+                        "importance": "central",
+                        "components": {"statement": "Theorem 1", "proof": "(none)"},
+                        "anchor": "Theorem 1. Every widget network is stable.",
+                        "section": "3. Main result",
+                    }
+                ]
+            }
+        )
+    )
+    small.queue(json.dumps({"action": "noop", "rationale": "deterministic plan is fine"}))
+    small.queue(json.dumps({"selected": [], "state_of_the_art_notes": "n/a"}))
+    strong.queue(_script_comments("claim"))
+    for _ in range(n_verify):
+        small.queue(_script_comments("lens"))
+    strong.queue(_script_comments("whole-paper"))
+    for title, _ in sections:
+        strong.queue(_script_challenge(title))
+    strong.queue(_script_challenge("whole-paper"))
+    n_defended = n_sections * 2 + 1 + 1
+    for i in range(n_defended):
+        small.queue(json.dumps({"defense": "weak", "defense_strength": "weak"}))
+        strong.queue(
+            json.dumps(
+                {
+                    "verdict": "upheld",
+                    "reason": "ok",
+                    "comment": {
+                        "title": f"upheld-{i}",
+                        "paragraph_anchor": "Theorem 1. Every widget network is stable.",
+                        "quote": "Every widget network is stable",
+                        "message": "State and prove the theorem or cite a source.",
+                        "score": 0.75,
+                        "category": "math",
+                    },
+                }
+            )
+        )
+    strong.queue(overall_json())
+    strong.queue(validator_json())
+
+    report1 = await pipeline.run(sample_paper_file)
+    spent1 = report1.usage.estimated_cost_usd
+    calls1 = len(pipeline._pool.ledger.calls)
+    assert calls1 > 0
+
+    # second run, same run_id: everything resumes; ledger is restored from state
+    pipeline2 = ReviewPipeline(test_config, run_id="resume01")
+    report2 = await pipeline2.run(sample_paper_file)
+    h2 = pipeline2._pool.harness
+    assert h2 is not None
+    assert len(h2.ledger.calls) == calls1, "resume must restore the persisted ledger"
+    assert report2.usage.estimated_cost_usd == pytest.approx(spent1)
+    assert report2.plan_summary is not None
+    assert report2.plan_summary.mode == "auto"
