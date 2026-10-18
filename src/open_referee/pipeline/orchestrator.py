@@ -1088,8 +1088,12 @@ class ReviewPipeline:
                 except LLMError as e:
                     logger.warning("challenger failed on %s: %s", title, e)
                     return cands
-                kept = [c for c in res.get("validated", []) if c.get("verdict") != "dropped"]
-                return kept + res.get("new_comments", [])
+                kept = [
+                    c
+                    for c in res.get("validated", [])
+                    if isinstance(c, dict) and c.get("verdict") != "dropped"
+                ]
+                return kept + [c for c in res.get("new_comments", []) if isinstance(c, dict)]
 
         tasks = [run_section(t, txt) for t, txt in sections]
         results = await asyncio.gather(*tasks)
@@ -1131,8 +1135,12 @@ class ReviewPipeline:
                 wp_user,
                 call_type="whole_paper_challenge",
             )
-            kept = [c for c in wp.get("validated", []) if c.get("verdict") != "dropped"]
-            validated.extend(kept + wp.get("new_comments", []))
+            kept = [
+                c
+                for c in wp.get("validated", [])
+                if isinstance(c, dict) and c.get("verdict") != "dropped"
+            ]
+            validated.extend(kept + [c for c in wp.get("new_comments", []) if isinstance(c, dict)])
             await self._emit(Stage.CHALLENGE, StageStatus.RUNNING, "whole-paper challenge done")
         except LLMError as e:
             logger.warning("whole-paper challenger failed: %s", e)

@@ -118,7 +118,7 @@ async def verify_claims(
             except Exception as e:
                 logger.warning("claim %s (%s) failed: %s", claim.get("id"), ctype, e)
                 return []
-            comments = res.get("comments", [])
+            comments = [c for c in res.get("comments", []) if isinstance(c, dict)]
             for c in comments:
                 c.setdefault("paragraph_anchor", claim.get("anchor", ""))
                 c["claim_id"] = claim.get("id")
