@@ -101,7 +101,13 @@ class FitPipeline:
                 if self.requested_budget_usd is not None
                 else self.cfg.review.max_cost_usd
             )
-            pool = RolePool.build(self.cfg, {ModelRole.STRONG, ModelRole.DECISION}, cap_usd=budget)
+            fit_roles = {ModelRole.STRONG}
+            try:
+                self.cfg.llm.role(ModelRole.DECISION)
+                fit_roles.add(ModelRole.DECISION)
+            except KeyError:
+                pass  # fallback mode: the editor LLM also estimates probability
+            pool = RolePool.build(self.cfg, fit_roles, cap_usd=budget)
             self._pool = pool
             try:
                 # 1. ingest (free)
