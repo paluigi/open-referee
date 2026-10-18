@@ -960,6 +960,15 @@ class ReviewPipeline:
 
         async def run_section(title: str, text: str):
             async with sem:
+                if not self.budget_allows("section_challenger"):
+                    self._note_gate_stop("section_challenger")
+                    # challengers are validators: pass candidates through
+                    # unvalidated rather than dropping them
+                    return [
+                        c
+                        for c in candidates
+                        if c.get("paragraph_anchor", "") and _anchor_in(c["paragraph_anchor"], text)
+                    ]
                 cands = [
                     c
                     for c in candidates
@@ -994,6 +1003,8 @@ class ReviewPipeline:
 
         # whole-paper challenge: validate cross-section candidates (those no
         # section challenger claimed) and hunt missed global weaknesses
+        from open_referee.pipeline.claims import defense_round
+
         try:
             claimed = {
                 _norm(c.get("paragraph_anchor", ""))[:120]
@@ -1006,6 +1017,10 @@ class ReviewPipeline:
                 for c in candidates
                 if isinstance(c, dict) and _norm(c.get("paragraph_anchor", ""))[:120] not in claimed
             ]
+            if not self.budget_allows("whole_paper_challenge"):
+                self._note_gate_stop("whole_paper_challenge")
+                validated.extend(wp_candidates)  # pass through unvalidated
+                return await defense_round(self, pool, doc, validated, self.cfg)
             await self._emit(Stage.CHALLENGE, StageStatus.RUNNING, "whole-paper challenge")
             wp_user = (
                 prompts.WHOLE_PAPER_CHALLENGER_USER.format(
@@ -1028,8 +1043,6 @@ class ReviewPipeline:
             logger.warning("whole-paper challenger failed: %s", e)
 
         # defense-adjudication quality gate (per comment, standard/deep only)
-        from open_referee.pipeline.claims import defense_round
-
         validated = await defense_round(self, pool, doc, validated, self.cfg)
         return validated
 
