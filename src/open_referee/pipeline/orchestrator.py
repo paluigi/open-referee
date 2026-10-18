@@ -137,7 +137,15 @@ class RolePool:
             rec2 = await self.ledger.record(spec, role.value, resp2, call_type=call_type)
             if self.harness is not None:
                 self.harness.note_record(rec2)
-            return extract_json(resp2.text)
+            try:
+                return extract_json(resp2.text)
+            except json.JSONDecodeError as e:
+                # never leak a raw decode error: stages catch LLMError and
+                # degrade gracefully instead of failing the whole run
+                raise LLMError(
+                    f"{spec.provider_name}/{spec.model} returned no parseable JSON even "
+                    f"after a repair attempt (last reply started: {resp2.text[:120]!r})"
+                ) from e
 
     async def close(self) -> None:
         for p in self.providers.values():
