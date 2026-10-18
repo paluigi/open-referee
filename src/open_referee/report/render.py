@@ -113,25 +113,27 @@ def render_fit_markdown(report: FitReport) -> str:
     parts += [""]
 
     parts += ["## Probability of passing the desk screen", ""]
-    parts.append(f"**{p:.0%}** (calibrated decision model)")
-    if report.llm_holistic_estimate is not None:
-        parts.append(f"LLM holistic estimate: **{report.llm_holistic_estimate:.0%}**")
+    parts.append(f"**{p:.0%}**")
+    if report.decision is not None:
+        src = (
+            "decision model over the editor's factor analyses"
+            if report.decision.source == "decision-model"
+            else "LLM fallback (no decision model configured)"
+        )
+        conf = (
+            f" · confidence {report.decision.confidence:.2f}"
+            if report.decision.confidence is not None
+            else ""
+        )
+        parts.append(f"_Verdict by {src}{conf}_")
     parts += [""]
-    w = report.calibration
-    weights_str = " + ".join(f"{w.get(f.name, 0.0):g}·{f.name}" for f in report.factors)
-    parts.append(
-        f"_Calibration: `sigmoid({w.get('bias', 0.0):g} + {weights_str})` "
-        "(0.5 is imputed for any unassessed factor; weights favor scope and aim, "
-        "which desk screens hinge on)._"
-    )
-    parts += [""]
+    if report.decision is not None and report.decision.question:
+        parts += [f"> Question judged: _{report.decision.question}_", ""]
 
-    parts += ["## Factor assessment", ""]
+    parts += ["## Factor assessment (editor's analyses)", ""]
     for f in report.factors:
-        parts.append(f"### {f.label} — {f.score:.2f} / 1.00")
-        if f.evidence:
-            parts += ["", f"> {f.evidence}"]
-        parts += ["", f.rationale or "_(no rationale provided)_", ""]
+        parts.append(f"### {f.label}")
+        parts += ["", f.analysis or "_(not assessed)_", ""]
 
     if report.reasoning:
         parts += ["## Editor reasoning", "", report.reasoning, ""]

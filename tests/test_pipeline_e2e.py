@@ -282,19 +282,13 @@ async def test_auto_mode_budget_driven_e2e(test_config, sample_paper_file, monke
             }
         )
     )
-    small.queue(  # the planner LLM call (after claims milestone)
+    strong.queue(  # strategy committee: LLM reflection (strong model, no decider here)
         json.dumps(
             {
-                "action": "plan",
-                "knobs": {
-                    "max_claims": 5,
-                    "per_section_lenses": True,
-                    "whole_paper_passes": True,
-                    "defense_round": True,
-                    "max_artifacts": 0,
-                },
-                "target_usd": 0.5,
-                "rationale": "Small theory paper; lean claim-focused plan suffices.",
+                "draft": "Small theory paper; claim-focused review.",
+                "critique": "Breadth passes are cheap here; keep whole-paper.",
+                "evaluation_summary": "Lean claims plus whole-paper pass.",
+                "preferred_path": "claims-light",
             }
         )
     )
@@ -347,17 +341,22 @@ async def test_auto_mode_budget_driven_e2e(test_config, sample_paper_file, monke
     assert any(ev.data.get("plan") for ev in plan_events)
     assert any(ev.data.get("budget") for ev in plan_events)
 
-    # the validated plan knobs drove the run (planner's claim trim survived)
+    # the committee committed a feasible frontier path (by construction)
     h = pipeline._pool.harness
-    assert h.plan.knobs.max_claims == 5
-    assert h.plan.planned_cost() <= h.budget_usd
+    assert h.plan.based_on == "frontier"
+    assert h.plan.knobs.max_claims <= 150
+    assert h.plan.planned_cost() <= h.effective_budget()
+    assert any(
+        a.reason == "strategy-committee" and a.action.startswith("frontier:")
+        for a in h.plan.adjustments
+    )
 
     # state persisted plan + ledger for resume accounting
     state = __import__("open_referee.pipeline.state", fromlist=["RunState"]).RunState.load(
         "auto01", runs_dir=runs_dir
     )
     assert state.status == "completed"
-    assert state.plan is not None and state.plan["knobs"]["max_claims"] == 5
+    assert state.plan is not None and state.plan["based_on"] == "frontier"
     assert state.ledger_calls, "ledger calls should persist for resume"
     planner_calls = [c for c in state.ledger_calls if c["call_type"] == "planner"]
     assert planner_calls, "planner call must be charged to the budget"
@@ -380,8 +379,9 @@ async def test_auto_mode_budget_driven_e2e(test_config, sample_paper_file, monke
     assert rec["stages"]["verify"]["actual"]["cost_usd"] > 0
     assert rec["stages"]["triage"]["control_plane"] is True
     assert rec["stages"]["triage"]["duration_s"] is not None
-    assert "preflight-v0" in [e["reason"] for e in rec["plan_log"]]
-    assert "claims-milestone" in [e["reason"] for e in rec["plan_log"]]
+    reasons = [e["reason"] for e in rec["plan_log"]]
+    assert "preflight-v0" in reasons
+    assert any(r.startswith("frontier:") for r in reasons)  # committee commit
     assert any(e["call_type"] == "planner" for e in rec["spend_timeline"])
     assert rec["call_types"]["claim_verify"]["actual_input_per_call"] is not None
     assert rec["pricing"]["fake/strong-fake"]["input_per_mtok"] == 3.0
@@ -454,7 +454,16 @@ async def test_resume_restores_spend_accounting(
             }
         )
     )
-    small.queue(json.dumps({"action": "noop", "rationale": "deterministic plan is fine"}))
+    strong.queue(
+        json.dumps(
+            {
+                "draft": "ok",
+                "critique": "ok",
+                "evaluation_summary": "continue",
+                "preferred_path": "lean-core",
+            }
+        )
+    )
     small.queue(json.dumps({"selected": [], "state_of_the_art_notes": "n/a"}))
     strong.queue(_script_comments("claim"))
     for _ in range(n_verify):

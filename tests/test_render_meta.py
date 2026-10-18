@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from open_referee.report.models import (
+    FitDecision,
     FitFactor,
     FitReport,
     PlanSummary,
@@ -102,19 +103,17 @@ def _fit_report() -> FitReport:
         run_id="f1",
         paper_title="Widget Networks",
         journal_profile="Top field journal, high novelty bar.",
+        decision=FitDecision(
+            probability=0.62,
+            confidence=0.71,
+            question="would pass the desk screen",
+            source="decision-model",
+        ),
         probability_not_desk_rejected=0.62,
-        llm_holistic_estimate=0.55,
         factors=[
-            FitFactor(
-                name="scope_fit",
-                label="Scope fit",
-                score=0.8,
-                rationale="Squarely in scope.",
-                evidence="widgets",
-            ),
-            FitFactor(name="aim_alignment", label="Aim alignment", score=0.7, rationale="ok"),
+            FitFactor(name="scope_fit", label="Scope fit", analysis="Squarely in scope."),
+            FitFactor(name="aim_alignment", label="Aim alignment", analysis="Aligned."),
         ],
-        calibration={"bias": -3.6, "scope_fit": 2.2, "aim_alignment": 1.8},
         reasoning="## Weighing\n\nScope is fine.",
         risks=["Novelty borderline"],
         suggestions=["Sharpen contribution"],
@@ -135,14 +134,13 @@ def _fit_report() -> FitReport:
     )
 
 
-def test_fit_markdown_renders_probability_factors_calibration():
+def test_fit_markdown_renders_decision_and_factor_analyses():
     md = render_fit_markdown(_fit_report())
     assert "# Journal fit estimate — Widget Networks" in md
-    assert "**62%** (calibrated decision model)" in md
-    assert "LLM holistic estimate: **55%**" in md
-    assert "sigmoid(-3.6" in md and "2.2·scope_fit" in md
-    assert "### Scope fit — 0.80 / 1.00" in md
-    assert "> widgets" in md
+    assert "**62%**" in md
+    assert "decision model over the editor's factor analyses" in md
+    assert "Question judged:" in md
+    assert "### Scope fit" in md and "Squarely in scope." in md
     assert "## Key risks" in md and "- Novelty borderline" in md
     assert "## Venue profile (as provided)" in md
     assert "## Build metadata" in md
@@ -152,7 +150,8 @@ def test_fit_markdown_renders_probability_factors_calibration():
 def test_reportlab_fallback_link_conversion():
     assert (
         _MD_LINK_RE.sub(
-            r"\1 (\2)", "Built with [open-referee](https://github.com/paluigi/open-referee)"
+            r"\1 (\2)",
+            "Built with [open-referee](https://github.com/paluigi/open-referee)",
         )
         == "Built with open-referee (https://github.com/paluigi/open-referee)"
     )

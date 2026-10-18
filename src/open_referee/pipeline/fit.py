@@ -1,10 +1,12 @@
 """Journal-fit / desk-reject estimator: a standalone, cheap product.
 
-One strong-model call compares the manuscript against a free-form venue
-profile (aim/scope/metrics + any institutional considerations), producing
-structured factor scores with evidence. A transparent deterministic
-calibration (weighted logistic — weights printed in the report) maps the
-factors to the probability of NOT being desk rejected.
+Two-step protocol (project-owner decision): the chat LLM writes the editor
+pass FIRST — six factor analyses (each hard-capped for brevity) plus overall
+reasoning — and the DECISION MODEL then takes the venue profile plus those
+factor texts as input and directly scores the desk-screen predicate. The
+final number is the decision model's probability; the LLM never produces it.
+Without a decision role configured, the LLM's own holistic estimate is used
+and the report says so.
 """
 
 from __future__ import annotations
@@ -24,47 +26,22 @@ from open_referee.pipeline.budget import (
     PricingError,
 )
 from open_referee.pipeline.state import RunState, Stage, StageStatus
-from open_referee.report.models import FitFactor, FitReport, PlanSummary, UsageSummary
+from open_referee.providers import LLMError
+from open_referee.providers.decisions import PredicateQuestion
+from open_referee.report.models import (
+    FitDecision,
+    FitFactor,
+    FitReport,
+    PlanSummary,
+    UsageSummary,
+)
 from open_referee.report.render import render_fit_markdown, render_fit_pdf
 
 logger = logging.getLogger(__name__)
 
 MAX_MANUSCRIPT_CHARS = 120_000
-
-# Decision model: P(not desk rejected) = sigmoid(bias + Σ w_i · s_i).
-# Weights favor scope/aim — what desk screens actually hinge on. These are
-# printed verbatim in every report so institutions see how the number forms.
-FIT_WEIGHTS: dict[str, float] = {
-    "scope_fit": 2.2,
-    "aim_alignment": 1.8,
-    "novelty_threshold": 1.4,
-    "methods_format_fit": 1.2,
-    "presentation_readiness": 0.9,
-    "policy_ethics": 1.0,
-}
-FIT_BIAS = -3.6
-
-FACTOR_LABELS = {
-    "scope_fit": "Scope fit",
-    "aim_alignment": "Aim alignment",
-    "methods_format_fit": "Methods & format fit",
-    "novelty_threshold": "Novelty vs venue threshold",
-    "presentation_readiness": "Presentation readiness",
-    "policy_ethics": "Policy & ethics compliance",
-}
-FACTOR_ORDER = list(FACTOR_LABELS)
-
-
-def calibrate_probability(factor_scores: dict[str, float]) -> float:
-    """Weighted logistic over the factor scores; missing factors default 0.5."""
-    import math
-
-    z = FIT_BIAS
-    for name, weight in FIT_WEIGHTS.items():
-        s = factor_scores.get(name, 0.5)
-        s = max(0.0, min(1.0, float(s)))
-        z += weight * s
-    return 1.0 / (1.0 + math.exp(-z))
+# hard character guard per factor analysis (~600 tokens x 4 chars/token)
+FACTOR_CHAR_CAP = prompts_fit.FACTOR_TOKEN_CAP * 4
 
 
 def _runs_dir() -> Path:
@@ -124,7 +101,7 @@ class FitPipeline:
                 if self.requested_budget_usd is not None
                 else self.cfg.review.max_cost_usd
             )
-            pool = RolePool.build(self.cfg, {ModelRole.STRONG}, cap_usd=budget)
+            pool = RolePool.build(self.cfg, {ModelRole.STRONG, ModelRole.DECISION}, cap_usd=budget)
             self._pool = pool
             try:
                 # 1. ingest (free)
@@ -135,11 +112,13 @@ class FitPipeline:
                 state.save()
                 await self._emit(Stage.INGEST, StageStatus.DONE, doc.title)
 
-                # 2. budget preflight: pricing is mandatory; budget must cover the call
+                # 2. budget preflight: pricing is mandatory; budget must cover the calls
                 harness = BudgetHarness(
                     self.cfg, pool.ledger, pool.specs, budget_usd=budget, auto=True
                 )
                 harness.stats = DocumentStats.from_doc(doc)
+                if pool.decider_spec is not None:
+                    harness.specs[ModelRole.DECISION] = pool.decider_spec
                 pool.harness = harness
                 harness.require_pricing()  # PricingError if unpriced
                 est = harness.unit_cost("fit_assessment")
@@ -151,14 +130,22 @@ class FitPipeline:
                         standard_budget_usd=round(est, 2),
                     )
 
-                # 3. the fit assessment — the product's single LLM call
-                await self._emit(Stage.FIT, StageStatus.RUNNING, "assessing journal fit")
-                user = prompts_fit.fit_user(
-                    journal_profile, doc.title, doc.full_text()[:MAX_MANUSCRIPT_CHARS]
+                # 3a. EDITOR PASS (strong LLM, first): six capped factor analyses
+                await self._emit(Stage.FIT, StageStatus.RUNNING, "editor pass: factor analyses")
+                user = prompts_fit.editor_user(
+                    journal_profile,
+                    doc.title,
+                    doc.full_text()[:MAX_MANUSCRIPT_CHARS],
+                    fallback=pool.decider is None,
                 )
                 res = await pool.complete_json(
-                    ModelRole.STRONG, prompts_fit.FIT_SYSTEM, user, call_type="fit_assessment"
+                    ModelRole.STRONG, prompts_fit.EDITOR_SYSTEM, user, call_type="fit_assessment"
                 )
+
+                # 3b. DECISION PASS: the verdict over profile + factor texts
+                decision = await self._decision_pass(pool, journal_profile, res)
+                state.ledger_calls = [c.model_dump(mode="json") for c in pool.ledger.calls]
+
                 state.artifacts["fit"] = {
                     k: res.get(k) for k in ("factors", "risks", "suggestions")
                 }
@@ -167,7 +154,7 @@ class FitPipeline:
                 await self._emit(Stage.FIT, StageStatus.DONE, "fit assessment done")
 
                 # 4. assemble + persist
-                report = self._assemble(res, doc.title, journal_profile, harness)
+                report = self._assemble(res, decision, doc.title, journal_profile, harness)
                 state.status = "completed"
                 state.save()
                 self._record_history("completed")
@@ -192,6 +179,133 @@ class FitPipeline:
             logger.exception("fit pipeline failed")
             raise
 
+    async def _decision_pass(self, pool, journal_profile: str, editor: dict) -> FitDecision:
+        """The decision model judges the LLM's analyses; without one, the
+        LLM's own holistic estimate is the fallback (and is labelled as such)."""
+        if getattr(pool, "decider", None) is not None:
+            factor_texts = []
+            for f in editor.get("factors", []) or []:
+                if isinstance(f, dict) and f.get("name"):
+                    label = prompts_fit.FACTOR_LABELS.get(str(f.get("name")), str(f.get("name")))
+                    factor_texts.append(
+                        f"## {label}\n{str(f.get('analysis', ''))[:FACTOR_CHAR_CAP]}"
+                    )
+            dm_input = (
+                f"## Venue profile\n\n{journal_profile[:12_000]}\n\n"
+                "## Editor factor analyses\n\n" + "\n\n".join(factor_texts)
+            )
+            try:
+                result = await pool.decide(
+                    dm_input,
+                    [
+                        PredicateQuestion(
+                            name="desk_screen",
+                            instructions=prompts_fit.DECISION_PREDICATE,
+                        )
+                    ],
+                    call_type="dm_fit",
+                )
+                a = result.answer("desk_screen")
+                if a is not None and a.probability is not None:
+                    return FitDecision(
+                        probability=a.probability,
+                        confidence=a.confidence,
+                        question=prompts_fit.DECISION_PREDICATE,
+                        source="decision-model",
+                    )
+            except LLMError as e:
+                logger.warning("decision pass failed (%s); falling back to LLM estimate", e)
+        # fallback: the editor's own estimate (or neutral 0.5)
+        try:
+            prob = float(editor.get("llm_estimate", 0.5))
+        except (TypeError, ValueError):
+            prob = 0.5
+        return FitDecision(
+            probability=max(0.0, min(1.0, prob)),
+            question=prompts_fit.DECISION_PREDICATE,
+            source="llm-fallback",
+        )
+
+    # -------------------------------------------------------------- assemble --
+
+    def _assemble(
+        self,
+        res: dict,
+        decision: FitDecision,
+        title: str,
+        journal_profile: str,
+        harness: BudgetHarness,
+    ) -> FitReport:
+        factors: list[FitFactor] = []
+        seen: set[str] = set()
+        for f in res.get("factors", []) or []:
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("name", "")).strip().lower()
+            if name not in prompts_fit.FACTOR_LABELS or name in seen:
+                continue
+            seen.add(name)
+            factors.append(
+                FitFactor(
+                    name=name,
+                    label=prompts_fit.FACTOR_LABELS[name],
+                    analysis=str(f.get("analysis", ""))[:FACTOR_CHAR_CAP],
+                )
+            )
+        factors.sort(key=lambda f: prompts_fit.FACTOR_ORDER.index(f.name))
+        for name in prompts_fit.FACTOR_ORDER:
+            if name not in seen:
+                factors.append(
+                    FitFactor(
+                        name=name,
+                        label=prompts_fit.FACTOR_LABELS[name],
+                        analysis="(not assessed by the editor)",
+                    )
+                )
+        u = self._pool.ledger
+        usage = UsageSummary(
+            tokens_by_role=u.by_role(),
+            estimated_cost_usd=round(u.total_cost(), 4),
+            total_input_tokens=int(u.total_tokens()[0]),
+            total_output_tokens=int(u.total_tokens()[1]),
+        )
+        st = harness.status()
+        report = FitReport(
+            run_id=self.run_id,
+            paper_title=title,
+            journal_profile=journal_profile,
+            decision=decision,
+            probability_not_desk_rejected=round(decision.probability, 4),
+            factors=factors,
+            reasoning=res.get("reasoning", ""),
+            risks=[str(r) for r in res.get("risks", []) or []],
+            suggestions=[str(s) for s in res.get("suggestions", []) or []],
+            usage=usage,
+            model_roles={
+                r.value: f"{p.provider_name}/{p.model}" for r, p in self._pool.specs.items()
+            },
+            plan_summary=PlanSummary(
+                mode="fit",
+                budget_usd=st["budget_usd"],
+                spent_usd=st["actual_usd"],
+                control_spent_usd=st["control_actual_usd"],
+                projected_final_usd=st["projected_final_usd"],
+            ),
+        )
+        if self._pool.decider is not None:
+            report.model_roles["decision"] = (
+                f"{self._pool.decider.provider_name}/{self._pool.decider.model}"
+            )
+        rdir = _runs_dir() / self.run_id
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / "report.json").write_text(report.model_dump_json(indent=2))
+        (rdir / "report.md").write_text(render_fit_markdown(report))
+        try:
+            render_fit_pdf(report, rdir / "report.pdf")
+        except Exception as e:  # PDF export must never fail the run
+            logger.warning("PDF export failed: %s", e)
+        return report
+
     def _record_history(self, status: str, error: str | None = None) -> None:
         """Append the per-phase estimation record to the run-history store.
         Best-effort: a history failure must never break the run itself."""
@@ -215,89 +329,3 @@ class FitPipeline:
             upsert_run_record(rec)
         except Exception:
             logger.exception("failed to record run history")
-
-    # -------------------------------------------------------------- assemble --
-
-    def _assemble(
-        self, res: dict, title: str, journal_profile: str, harness: BudgetHarness
-    ) -> FitReport:
-        scores: dict[str, float] = {}
-        factors: list[FitFactor] = []
-        for f in res.get("factors", []) or []:
-            if not isinstance(f, dict):
-                continue
-            name = str(f.get("name", "")).strip().lower()
-            if name not in FACTOR_LABELS:
-                continue
-            try:
-                score = max(0.0, min(1.0, float(f.get("score", 0.5))))
-            except (TypeError, ValueError):
-                score = 0.5
-            scores[name] = score
-            factors.append(
-                FitFactor(
-                    name=name,
-                    label=FACTOR_LABELS[name],
-                    score=score,
-                    rationale=str(f.get("rationale", "")),
-                    evidence=f.get("evidence"),
-                )
-            )
-        # stable order; ensure all six present for the calibration
-        factors.sort(key=lambda f: FACTOR_ORDER.index(f.name))
-        for name in FACTOR_ORDER:
-            if name not in scores:
-                scores[name] = 0.5
-                factors.append(
-                    FitFactor(
-                        name=name,
-                        label=FACTOR_LABELS[name],
-                        score=0.5,
-                        rationale="(not assessed — default score applied)",
-                    )
-                )
-        try:
-            holistic = res.get("llm_holistic_estimate")
-            holistic = max(0.0, min(1.0, float(holistic))) if holistic is not None else None
-        except (TypeError, ValueError):
-            holistic = None
-        u = self._pool.ledger
-        usage = UsageSummary(
-            tokens_by_role=u.by_role(),
-            estimated_cost_usd=round(u.total_cost(), 4),
-            total_input_tokens=int(u.total_tokens()[0]),
-            total_output_tokens=int(u.total_tokens()[1]),
-        )
-        st = harness.status()
-        report = FitReport(
-            run_id=self.run_id,
-            paper_title=title,
-            journal_profile=journal_profile,
-            probability_not_desk_rejected=round(calibrate_probability(scores), 4),
-            llm_holistic_estimate=holistic,
-            factors=factors,
-            calibration={"bias": FIT_BIAS, **FIT_WEIGHTS},
-            reasoning=res.get("reasoning", ""),
-            risks=[str(r) for r in res.get("risks", []) or []],
-            suggestions=[str(s) for s in res.get("suggestions", []) or []],
-            usage=usage,
-            model_roles={
-                r.value: f"{p.provider_name}/{p.model}" for r, p in self._pool.specs.items()
-            },
-            plan_summary=PlanSummary(
-                mode="fit",
-                budget_usd=st["budget_usd"],
-                spent_usd=st["actual_usd"],
-                control_spent_usd=st["control_actual_usd"],
-                projected_final_usd=st["projected_final_usd"],
-            ),
-        )
-        rdir = _runs_dir() / self.run_id
-        rdir.mkdir(parents=True, exist_ok=True)
-        (rdir / "report.json").write_text(report.model_dump_json(indent=2))
-        (rdir / "report.md").write_text(render_fit_markdown(report))
-        try:
-            render_fit_pdf(report, rdir / "report.pdf")
-        except Exception as e:  # PDF export must never fail the run
-            logger.warning("PDF export failed: %s", e)
-        return report

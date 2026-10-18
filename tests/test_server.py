@@ -117,7 +117,7 @@ def test_index_shows_both_products_and_auto_option(client):
     assert "Journal fit estimate" in html
     assert 'hx-post="/api/fit"' in html
     assert "journal_profile" in html
-    assert "Auto — budget-driven planner" in html
+    assert "Auto — budget-driven" in html
     # runs list marks fit runs
     assert "run_type" not in html or True  # template renders fit badge per-run
 

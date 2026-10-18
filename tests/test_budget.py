@@ -238,14 +238,15 @@ async def test_no_replan_when_on_plan():
     assert s.action == "none"
 
 
-async def test_replan_throttled_by_allowance():
+async def test_replans_are_not_count_limited():
+    """Project-owner decision: replan count is unbounded; anti-thrash comes
+    from deviation thresholds only."""
     h, _ = make_harness(budget=10.0)
     plan = h.deterministic_plan()
-    plan.planner_calls_used = plan.planner_calls_max
+    plan.planner_calls_used = 99  # far beyond any old allowance
     h.set_plan(plan)
-    # force an obvious overrun: actual spend already near the cap
     _rec(h, "claim_verify", 9.9)
-    assert h.should_replan() is None  # allowance exhausted -> deterministic only
+    assert h.should_replan() is not None  # still fires on material overrun
 
 
 async def test_overrun_yields_viable_repair_options():

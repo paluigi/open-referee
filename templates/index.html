@@ -29,14 +29,16 @@
           <input type="file" name="literature" multiple accept=".pdf,.docx,.tex,.md">
         </label>
         <label>Depth
-          <select name="depth">
+          <select name="depth" id="depth-select">
             <option value="default">Use settings default ({{ cfg.review.depth }})</option>
-            <option value="auto">Auto — budget-driven planner</option>
-            <option value="fast">fast</option>
-            <option value="standard">standard</option>
-            <option value="deep">deep</option>
+            <option value="auto">Auto — budget-driven (est. floor: <span id="est-fast">…</span>)</option>
+            <option value="fast">fast (est. <span data-est="fast">…</span>)</option>
+            <option value="standard">standard (est. <span data-est="standard">…</span>)</option>
+            <option value="deep">deep (est. <span data-est="deep">…</span>)</option>
           </select>
         </label>
+        <p class="muted small" id="estimate-note">Select a manuscript to get mechanical cost
+          estimates for the presets (no model is called).</p>
         <label>Budget for this run (USD, optional — cap in every mode, drives the planner in auto)
           <input type="number" name="budget" step="0.5" min="0" placeholder="{{ '%g'|format(cfg.review.max_cost_usd) }}">
         </label>
@@ -92,6 +94,36 @@
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+    // mechanical preset estimates on file select (zero model calls)
+    const reviewForm = document.querySelector('form[hx-post="/api/reviews"]');
+    const paperInput = reviewForm ? reviewForm.querySelector('input[name="paper"]') : null;
+    if (paperInput) {
+      paperInput.addEventListener("change", async () => {
+        if (!paperInput.files.length) return;
+        const fd = new FormData();
+        fd.append("paper", paperInput.files[0]);
+        try {
+          const r = await fetch("/api/estimate", { method: "POST", body: fd });
+          const data = await r.json();
+          if (data.ok) {
+            document.querySelectorAll("[data-est]").forEach((el) => {
+              el.textContent = "$" + (+data.estimates_usd[el.dataset.est]).toFixed(2);
+            });
+            const fast = document.getElementById("est-fast");
+            if (fast) fast.textContent = "$" + (+data.estimates_usd.fast).toFixed(2);
+            const note = document.getElementById("estimate-note");
+            if (note) note.textContent =
+              "Estimates for this manuscript (mechanical, no model called): fast $" +
+              (+data.estimates_usd.fast).toFixed(2) + " · standard $" +
+              (+data.estimates_usd.standard).toFixed(2) + " · deep $" +
+              (+data.estimates_usd.deep).toFixed(2);
+          } else {
+            const note = document.getElementById("estimate-note");
+            if (note) note.textContent = "Estimates unavailable: " + (data.error || "").slice(0, 160);
+          }
+        } catch (e) { /* estimates are optional UX */ }
+      });
     }
     // both product forms return {"run_id": ...} — jump straight to the run page
     document.body.addEventListener('htmx:afterRequest', (e) => {

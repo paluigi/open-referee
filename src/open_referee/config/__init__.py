@@ -27,6 +27,7 @@ class ProviderType(str, Enum):
     GEMINI = "gemini"
     OLLAMA = "ollama"
     VLLM = "vllm"
+    DECISION = "decision"  # typed evaluation API (/v1/decisions), no free text
     FAKE = "fake"
 
 
@@ -34,6 +35,7 @@ class ModelRole(str, Enum):
     STRONG = "strong"
     SMALL = "small"
     VISION = "vision"
+    DECISION = "decision"
 
 
 class ProviderConfig(BaseModel):

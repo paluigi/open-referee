@@ -28,23 +28,23 @@ from open_referee.literature import (
     PeerReviewScout,
     SearchRouter,
 )
-from open_referee.pipeline import prompts, prompts_plan
+from open_referee.pipeline import prompts
 from open_referee.pipeline.budget import (
     BudgetHarness,
     BudgetInfeasible,
     DocumentStats,
     PlanKnobs,
     PricingError,
-    RepairOption,
     ReviewPlan,
-    Steering,
 )
+from open_referee.pipeline.committee import ReviewIncomplete
 from open_referee.pipeline.state import RunState, Stage, StageEvent, StageStatus
 from open_referee.providers import (
     BudgetExceeded,
     ChatMessage,
     ChatProvider,
     LLMError,
+    LLMResponse,
     ModelSpec,
     UsageLedger,
 )
@@ -74,16 +74,30 @@ class RolePool:
     ledger: UsageLedger
     providers: dict[ModelRole, ChatProvider] = field(default_factory=dict)
     specs: dict[ModelRole, ModelSpec] = field(default_factory=dict)
+    decider: object | None = None  # DecisionProvider when llm.roles.decision is set
+    decider_spec: ModelSpec | None = None
     harness: BudgetHarness | None = None  # budget tracking back-reference
 
     @classmethod
     def build(cls, cfg: Config, roles: set[ModelRole], cap_usd: float | None = None) -> RolePool:
-        from open_referee.providers.factory import build_provider
+        from open_referee.providers.factory import build_decision_provider, build_provider
 
         cap = cap_usd if cap_usd is not None else cfg.review.max_cost_usd
         pool = cls(cfg=cfg, ledger=UsageLedger(cap, cfg.llm.pricing))
         for role in roles:
             role_cfg = cfg.llm.role(role)
+            if role is ModelRole.DECISION:
+                pool.decider = build_decision_provider(cfg.llm, role_cfg)
+                pool.decider_spec = ModelSpec(
+                    provider_name=role_cfg.provider,
+                    provider_type="decision",
+                    model=role_cfg.model,
+                    base_url=cfg.llm.providers[role_cfg.provider].base_url,
+                    api_key=cfg.llm.providers[role_cfg.provider].resolved_api_key(),
+                    timeout_s=cfg.llm.request_timeout_s,
+                    max_retries=cfg.llm.max_retries,
+                )
+                continue
             pool.providers[role] = build_provider(cfg.llm, role_cfg)
             pcfg = cfg.llm.providers[role_cfg.provider]
             pool.specs[role] = ModelSpec(
@@ -98,6 +112,20 @@ class RolePool:
                 max_retries=cfg.llm.max_retries,
             )
         return pool
+
+    async def decide(self, input: str, questions, call_type: str = "dm_other"):
+        """Typed decision call through the ledger: budget-checked, recorded,
+        harness-notified — decision calls are model calls like any other."""
+        if self.decider is None or self.decider_spec is None:
+            raise LLMError("No decision model configured (llm.roles.decision)")
+        est_in = max(1, len(input) // 3)
+        await self.ledger.check_budget(self.decider_spec, est_in, 1)
+        result = await self.decider.decide(input, questions)
+        shim = LLMResponse(text="", usage=result.usage)
+        rec = await self.ledger.record(self.decider_spec, "decision", shim, call_type=call_type)
+        if self.harness is not None:
+            self.harness.note_record(rec)
+        return result
 
     async def complete_json(
         self, role: ModelRole, system: str, user: str, call_type: str = "other"
@@ -169,6 +197,8 @@ class ReviewPipeline:
         self.state: RunState | None = None
         self._subscribers: list[asyncio.Queue[StageEvent]] = []
         self._pool: RolePool | None = None
+        self._triage_cache: dict | None = None
+        self._claims_ranked = False
         self._venue_block: str = ""
         if self.journal_profile:
             self._venue_block = (
@@ -211,6 +241,12 @@ class ReviewPipeline:
         self, paper_path: str | Path, literature_paths: list[str | Path] | None = None
     ) -> ReviewReport:
         state = self._load_or_create_state(paper_path, literature_paths)
+        resuming_incomplete = state.status == "incomplete"
+        if resuming_incomplete:
+            # restart-with-top-up: continue from persisted artifacts under the
+            # new budget without rerunning completed stages
+            state.status = "running"
+            state.error = None
         self.state = state
         state.run_type = "review"
         state.requested_depth = self.requested_depth
@@ -246,11 +282,17 @@ class ReviewPipeline:
 
             # 1b. budget preflight + initial (deterministic) plan — free of LLM cost
             await self._init_budget(pool, doc)
+            if resuming_incomplete and pool.harness is not None and pool.harness.plan is not None:
+                from open_referee.pipeline import committee
+
+                # pick up the continuation the new budget can afford
+                await committee.replan_choice(self, pool, "resume-topup")
 
             # 2. triage
             triage = await self._stage_or_resume(
                 Stage.TRIAGE, lambda: self._triage(pool, doc), skip_key="triage"
             )
+            self._triage_cache = triage
             queries = triage.get("search_queries", [])[:8]
             key_citations = triage.get("key_citations", [])
 
@@ -258,12 +300,18 @@ class ReviewPipeline:
             claims = await self._stage_or_resume(
                 Stage.CLAIMS, lambda: self._claim_inventory(pool, doc, triage), skip_key="claims"
             )
-            # claims milestone: exact claim count is the dominant cost driver,
-            # so the (single) planner LLM call happens here, informed by reality
+            # claims milestone: exact claim count is the dominant cost driver.
+            # claims are importance-ranked (decision model when available),
+            # then the committee commits a frontier path for the run.
             if pool.harness is not None:
                 pool.harness.stats.n_claims = len(claims) if claims else 0
             if self._is_auto() and not state.stage_status(Stage.VERIFY) == StageStatus.DONE:
-                await self._plan_milestone(pool, "claims")
+                from open_referee.pipeline import committee
+
+                claims = await committee.rank_claims(self, pool, claims)
+                self._claims_ranked = True
+                state.artifacts["claims"] = claims  # ranked order persists
+                await committee.strategy_committee(self, pool, claims)
 
             # 3+4. literature survey + community scout (concurrent)
             pack = await self._stage_or_resume(
@@ -281,14 +329,14 @@ class ReviewPipeline:
                 lambda: self._verify(pool, doc, pack, triage, claims),
                 skip_key="candidates",
             )
-            await self._budget_checkpoint(pool, Stage.VERIFY)
+            await self._replan_checkpoint(pool, "verify")
             # 6. challenge
             validated = await self._stage_or_resume(
                 Stage.CHALLENGE,
                 lambda: self._challenge(pool, doc, pack, candidates),
                 skip_key="validated",
             )
-            await self._budget_checkpoint(pool, Stage.CHALLENGE)
+            await self._replan_checkpoint(pool, "challenge")
             # 7. bibliography
             bib = await self._stage_or_resume(
                 Stage.BIBLIOGRAPHY,
@@ -321,6 +369,11 @@ class ReviewPipeline:
             self._record_history("failed", str(e))
             await self._emit(Stage.ASSEMBLE, StageStatus.FAILED, f"cannot run: {e}")
             raise
+        except ReviewIncomplete as e:
+            # wrap-up produced the best possible report; the run is resumable
+            # with a budget top-up (completed stages are reused)
+            self._record_history("incomplete", e.cause)
+            return e.report
         except BudgetExceeded as e:
             # Drain gracefully: assemble a partial report from whatever the
             # pipeline managed to produce before the spend cap tripped.
@@ -402,24 +455,29 @@ class ReviewPipeline:
     async def _ensure_pool(self) -> RolePool:
         if self._pool is None:
             roles = {ModelRole.STRONG, ModelRole.SMALL}
-            try:
-                self.cfg.llm.role(ModelRole.VISION)
-                roles.add(ModelRole.VISION)
-            except KeyError:
-                pass
+            for extra in (ModelRole.VISION, ModelRole.DECISION):
+                try:
+                    self.cfg.llm.role(extra)
+                    roles.add(extra)
+                except KeyError:
+                    pass
             self._pool = RolePool.build(self.cfg, roles, cap_usd=self._effective_budget())
         return self._pool
 
     # ---------------------------------------------------------------- budget --
 
     async def _init_budget(self, pool: RolePool, doc: Document) -> None:
-        """Preflight + initial deterministic plan (no LLM cost).
+        """Preflight + initial plan (no LLM cost).
 
         Auto mode: pricing must be configured (hard error) and the budget
-        must buy a meaningful minimum (hard error suggesting the minimum).
-        Preset modes: the harness still tracks spend against a deterministic
-        estimate of the preset so the live view works; pricing gaps warn.
+        must clear the fast-preset floor for THIS paper (hard error listing
+        all three preset estimates — rejected before any model call).
+        Preset modes: uncapped by design — a deterministic estimate of the
+        chosen preset is tracked for the live view and the final
+        estimate-vs-actual report, but nothing is enforced in flight.
         """
+        import math
+
         harness = BudgetHarness(
             self.cfg,
             pool.ledger,
@@ -428,7 +486,12 @@ class ReviewPipeline:
             auto=self._is_auto(),
         )
         harness.stats = DocumentStats.from_doc(doc)
+        if pool.decider_spec is not None:
+            harness.specs[ModelRole.DECISION] = pool.decider_spec
         pool.harness = harness
+        if not self._is_auto():
+            # uncapped preset mode: estimate-only tracking, no enforcement
+            pool.ledger.cap_usd = math.inf
         # resume: restore plan + spend accounting from persisted state
         assert self.state is not None
         if self.state.ledger_calls:
@@ -453,6 +516,17 @@ class ReviewPipeline:
                 raise
             logger.warning("pricing incomplete, budget tracking degraded: %s", e)
         if self._is_auto():
+            # floor: reject budgets below the fast-preset estimate, zero model calls
+            est = harness.preset_estimates()
+            if harness.budget_usd < est["fast"]:
+                raise BudgetInfeasible(
+                    f"Budget ${harness.budget_usd:.2f} is below the cost of even a "
+                    f"'fast' review of this paper (≈ ${est['fast']:.2f}). Preset "
+                    f"estimates for this manuscript: fast ≈ ${est['fast']:.2f}, "
+                    f"standard ≈ ${est['standard']:.2f}, deep ≈ ${est['deep']:.2f}.",
+                    min_budget_usd=round(est["fast"], 2),
+                    standard_budget_usd=round(est["standard"], 2),
+                )
             plan = harness.deterministic_plan(reason="preflight")
             harness.set_plan(plan, reason="preflight-v0")
             await self._emit_plan_event("plan v0 (deterministic preflight)", plan)
@@ -461,7 +535,11 @@ class ReviewPipeline:
             knobs = PlanKnobs.from_preset(self.cfg.review.depth_preset())
             plan = harness.preset_plan(knobs, depth)
             harness.set_plan(plan, reason="preset-tracking")
-            await self._emit_plan_event(f"tracking preset '{depth}' spend", plan)
+            await self._emit_plan_event(
+                f"preset '{depth}' — estimate ${plan.target_usd:.2f} (uncapped, "
+                "spend reported at the end)",
+                plan,
+            )
         self._sync_budget_to_state()
         self.state.save()
 
@@ -474,75 +552,13 @@ class ReviewPipeline:
             data={"plan": plan.model_dump(mode="json"), "budget": st},
         )
 
-    async def _plan_milestone(self, pool: RolePool, milestone: str) -> None:
-        """The single baseline planner LLM call (auto mode), informed by the
-        milestone data (claim count). Falls back to the deterministic plan."""
-        harness = pool.harness
-        if harness is None or harness.plan is None:
-            return
-        briefing = harness.briefing()
-        try:
-            res = await pool.complete_json(
-                ModelRole.SMALL,
-                prompts_plan.PLANNER_SYSTEM,
-                prompts_plan.planner_user(briefing),
-                call_type="planner",
-            )
-        except (LLMError, BudgetExceeded, json.JSONDecodeError) as e:
-            logger.warning("planner call failed (%s); deterministic plan kept", e)
-            res = {}
-        harness.plan.planner_calls_used += 1
-        plan = self._planner_response_to_plan(harness, res, milestone)
-        harness.set_plan(plan, reason=f"{milestone}-milestone")
-        await self._emit(
-            Stage.PLAN,
-            StageStatus.RUNNING,
-            f"plan v{plan.plan_version} ({milestone} milestone): target "
-            f"${plan.target_usd:.2f} of ${plan.budget_usd:.2f}",
-            data={"plan": plan.model_dump(mode="json"), "budget": harness.status()},
-        )
-        self._sync_budget_to_state()
-        self.state.save()
+    async def _replan_checkpoint(self, pool: RolePool, where: str) -> None:
+        """Checkpoint after stages/sub-stages: telemetry when on-plan; when the
+        harness flags a deviation (or a spike), rebuild the residual frontier
+        and let the committee pick a continuation. When NOTHING is feasible,
+        wrap up the review as incomplete (raises ReviewIncomplete)."""
+        from open_referee.pipeline import committee
 
-    def _planner_response_to_plan(
-        self, harness: BudgetHarness, res: dict, source: str
-    ) -> ReviewPlan:
-        assert harness.plan is not None
-        action = str(res.get("action", "")).lower()
-        knobs_dict = res.get("knobs")
-        if action == "plan" and isinstance(knobs_dict, dict):
-            try:
-                knobs = PlanKnobs.model_validate(knobs_dict)
-            except Exception:
-                knobs = harness.plan.knobs
-            candidate = harness.plan.model_copy(
-                update={
-                    "knobs": knobs,
-                    "rationale": str(res.get("rationale", ""))[:1000] or harness.plan.rationale,
-                    "planner_calls_used": harness.plan.planner_calls_used,
-                }
-            )
-            return harness.validate_plan(candidate, source="planner")
-        # noop / unrecognized: keep the deterministic plan, note the rationale
-        from open_referee.pipeline.budget import PlanAdjustment
-
-        return harness.plan.model_copy(
-            update={
-                "adjustments": harness.plan.adjustments
-                + [
-                    PlanAdjustment(
-                        reason=source,
-                        action="keep-plan",
-                        detail=str(res.get("action") or "no valid reply")[:200],
-                        source="planner",
-                    )
-                ]
-            }
-        )
-
-    async def _budget_checkpoint(self, pool: RolePool, finished_stage: Stage) -> None:
-        """Stage-boundary steering: deterministic first, planner LLM only for
-        genuine multi-option judgment calls (throttled by the harness)."""
         harness = pool.harness
         if harness is None or harness.plan is None:
             return
@@ -552,68 +568,16 @@ class ReviewPipeline:
             await self._emit(
                 Stage.PLAN,
                 StageStatus.RUNNING,
-                f"budget after {finished_stage.value}: ${st['actual_usd']:.2f} spent, "
+                f"budget after {where}: ${st['actual_usd']:.2f} spent, "
                 f"${st['projected_final_usd']:.2f} projected of ${st['budget_usd']:.2f}",
                 data={"budget": st},
             )
             self._sync_budget_to_state()
             return
-        steering: Steering = harness.steer()
-        if steering.action == "none":
-            return
-        if steering.action == "applied" and steering.applied is not None:
-            plan = harness.apply_option(steering.applied, reason=reason)
-            harness.set_plan(plan, reason=f"steering:{steering.applied.action}")
-            await self._emit(
-                Stage.PLAN,
-                StageStatus.RUNNING,
-                f"budget steering: {steering.applied.label} (saves "
-                f"${steering.applied.saves_usd:.2f}) — {reason}",
-                data={"plan": plan.model_dump(mode="json"), "budget": harness.status()},
-            )
-        elif steering.action == "needs_planner" and steering.options:
-            plan = await self._planner_choose(pool, steering.options, reason)
-            await self._emit(
-                Stage.PLAN,
-                StageStatus.RUNNING,
-                f"plan v{plan.plan_version} adjusted by planner — {reason}",
-                data={"plan": plan.model_dump(mode="json"), "budget": harness.status()},
-            )
-        else:  # cant_fix: per-call gating + hard cap take over
-            await self._emit(
-                Stage.PLAN,
-                StageStatus.RUNNING,
-                f"budget warning: {steering.note}",
-                data={"budget": harness.status()},
-            )
-        self._sync_budget_to_state()
+        applied = await committee.replan_choice(self, pool, reason)
+        if not applied:
+            await committee.wrapup_incomplete(self, pool, reason)
         self.state.save()
-
-    async def _planner_choose(
-        self, pool: RolePool, options: list[RepairOption], reason: str
-    ) -> ReviewPlan:
-        harness = pool.harness
-        assert harness is not None and harness.plan is not None
-        briefing = harness.briefing(options=options)
-        chosen: RepairOption | None = None
-        try:
-            res = await pool.complete_json(
-                ModelRole.SMALL,
-                prompts_plan.PLANNER_SYSTEM,
-                prompts_plan.planner_user(briefing),
-                call_type="planner",
-            )
-            idx = res.get("option_index")
-            if isinstance(idx, int) and 0 <= idx < len(options):
-                chosen = options[idx]
-        except (LLMError, BudgetExceeded, json.JSONDecodeError) as e:
-            logger.warning("planner choice failed (%s); taking largest savings", e)
-        harness.plan.planner_calls_used += 1
-        if chosen is None:
-            chosen = options[0]  # largest projected savings (sorted desc)
-        plan = harness.apply_option(chosen, reason=reason, source="planner")
-        harness.set_plan(plan, reason=f"planner-choose:{chosen.action}")
-        return plan
 
     def _sync_budget_to_state(self) -> None:
         """Persist plan + ledger so a resumed run keeps spend accounting."""
@@ -744,14 +708,89 @@ class ReviewPipeline:
             notes="; ".join(notes) or None,
         )
 
+    async def _dm_triage_classification(self, pool: RolePool, doc: Document) -> dict:
+        """Closed-set triage classification via the decision model (batched,
+        one call). Open-vocabulary fields stay with the LLM."""
+        if getattr(pool, "decider", None) is None:
+            return {}
+        from open_referee.providers.decisions import ChoiceQuestion, ScoreQuestion
+
+        abstract = doc.full_text()[:8000]
+        questions = [
+            ChoiceQuestion(
+                name="paper_type",
+                instructions="The manuscript's dominant type.",
+                choices=[{"value": v} for v in ("theory", "empirical", "mixed", "survey", "other")],
+            ),
+            ScoreQuestion(
+                name="mathematical_density",
+                instructions="Density of formal mathematics (theorems, proofs, derivations).",
+                levels=[{"label": v} for v in ("none", "light", "moderate", "heavy")],
+            ),
+            ChoiceQuestion(
+                name="statistical_content",
+                instructions="The kind of statistical/econometric content.",
+                choices=[
+                    {"value": v}
+                    for v in ("none", "descriptive", "inferential", "causal", "forecasting")
+                ],
+            ),
+            ChoiceQuestion(
+                name="methodological_style",
+                instructions="The dominant methodological style.",
+                choices=[
+                    {"value": v}
+                    for v in (
+                        "analytical-theory",
+                        "econometrics",
+                        "machine-learning",
+                        "simulation",
+                        "mixed",
+                    )
+                ],
+            ),
+        ]
+        try:
+            result = await pool.decide(
+                f"Manuscript: {doc.title}\n\n{abstract}", questions, call_type="dm_triage"
+            )
+        except LLMError as e:
+            logger.warning("DM triage classification failed (%s); LLM covers it", e)
+            return {}
+        out: dict = {}
+        a = result.answer("paper_type")
+        if a and a.choice:
+            out["paper_type"] = a.choice
+        a = result.answer("mathematical_density")
+        if a and a.probabilities:
+            # score level index -> label with the highest probability
+            best = max(a.probabilities, key=lambda d: d.get("probability", 0))
+            if isinstance(best.get("value"), int) and 0 <= best["value"] < 4:
+                out["mathematical_density"] = ["none", "light", "moderate", "heavy"][best["value"]]
+        for name in ("statistical_content", "methodological_style"):
+            a = result.answer(name)
+            if a and a.choice:
+                out[name] = a.choice
+        return out
+
     async def _triage(self, pool: RolePool, doc: Document) -> dict:
+        # decision-model half: closed-set classification (skipped without a decider)
+        dm_class = await self._dm_triage_classification(pool, doc)
+        # LLM half: open-vocabulary domain + generative fields (queries, citations)
         user = (
             prompts.TRIAGE_USER.format(title=doc.title, manuscript=self._manuscript_trunc(doc))
             + self._venue_block
         )
+        if dm_class:
+            user += (
+                "\n\n## Classification already determined (use as given)\n\n"
+                + json.dumps(dm_class)
+                + "\nFocus your reply on domain, search queries, key citations, main claims.\n"
+            )
         triage = await pool.complete_json(
             ModelRole.STRONG, prompts.TRIAGE_SYSTEM, user, call_type="triage"
         )
+        triage.update(dm_class)  # DM classification wins on shared keys
         if pool.harness is not None:
             pool.harness.stats.n_lenses = len(self._lenses_for(triage))
         return triage
@@ -800,6 +839,46 @@ class ReviewPipeline:
                 if key and key not in seen:
                     seen.add(key)
                     pack.items.append(it)
+            # decision-model relevance filter (batched predicates, one call):
+            # drop clearly irrelevant items before the surveyor reads the pack
+            if getattr(pool, "decider", None) is not None and pack.items:
+                from open_referee.providers.decisions import PredicateQuestion
+
+                q_items = "\n".join(
+                    f"{i}. {it.title[:120]} — {(it.why_relevant or '')[:80]}"
+                    for i, it in enumerate(pack.items[:40], 1)
+                )
+                qs = [
+                    PredicateQuestion(
+                        name=f"item_{i}",
+                        instructions=(
+                            f"Literature item {i} is relevant background for reviewing a "
+                            "manuscript in this field and should be kept in the context pack."
+                        ),
+                    )
+                    for i in range(1, min(len(pack.items), 40) + 1)
+                ]
+                try:
+                    dm = await pool.decide(
+                        f"Field: {triage.get('domain', 'unknown')}\n\nItems:\n{q_items}",
+                        qs,
+                        call_type="dm_survey",
+                    )
+                    kept = []
+                    for i, it in enumerate(pack.items[:40], 1):
+                        a = dm.answer(f"item_{i}")
+                        if a is None or a.probability is None or a.probability >= 0.5:
+                            kept.append(it)
+                    dropped = len(pack.items) - len(kept)
+                    pack.items = kept + pack.items[40:]
+                    if dropped:
+                        await self._emit(
+                            Stage.SURVEY,
+                            StageStatus.RUNNING,
+                            f"decision filter dropped {dropped} irrelevant literature items",
+                        )
+                except LLMError as e:
+                    logger.warning("DM survey filter failed (%s); keeping all items", e)
             # surveyor refines relevance + missing refs (small role) — still inside
             # the client contexts so Crossref lookups below remain valid
             try:
@@ -887,6 +966,7 @@ class ReviewPipeline:
         if claims:
             await self._emit(Stage.VERIFY, StageStatus.RUNNING, "per-claim verification")
             candidates.extend(await verify_claims(self, pool, doc, claims, self.cfg))
+        await self._replan_checkpoint(pool, "verify/claims")
 
         sections = self._reviewable_sections(doc)
         lenses = self._lenses_for(triage) if knobs.per_section_lenses else []
@@ -922,12 +1002,20 @@ class ReviewPipeline:
         results = await asyncio.gather(*tasks)
         for r in results:
             candidates.extend(r)
+            if r and pool.harness is not None:
+                pool.harness.note_yield(
+                    "lens_section", len(r), max((float(c.get("score", 0)) for c in r), default=0.0)
+                )
+        await self._replan_checkpoint(pool, "verify/lenses")
 
         # artifact verification: ALL figures and ALL tables vs prose (vision role)
         if ModelRole.VISION in pool.providers and (doc.figures or doc.tables):
             await self._emit(Stage.VERIFY, StageStatus.RUNNING, "artifact verification")
             art_comments = await verify_artifacts(self, pool, doc, self.cfg)
             candidates.extend(art_comments)
+            if art_comments and pool.harness is not None:
+                pool.harness.note_yield("artifact_verify", len(art_comments), 0.5)
+        await self._replan_checkpoint(pool, "verify/artifacts")
 
         # whole-paper pass: cross-section coherence (strong model, full text)
         if not knobs.whole_paper_passes:
@@ -943,7 +1031,14 @@ class ReviewPipeline:
                 wp_user,
                 call_type="whole_paper_verify",
             )
-            candidates.extend(wp.get("comments", []))
+            wp_comments = wp.get("comments", [])
+            candidates.extend(wp_comments)
+            if wp_comments and pool.harness is not None:
+                pool.harness.note_yield(
+                    "whole_paper_verify",
+                    len(wp_comments),
+                    max((float(c.get("score", 0)) for c in wp_comments), default=0.0),
+                )
             await self._emit(
                 Stage.VERIFY,
                 StageStatus.RUNNING,
@@ -1089,7 +1184,53 @@ class ReviewPipeline:
             ModelRole.STRONG, prompts.META_SYSTEM, user, call_type="meta"
         )
 
+    async def _dm_validator_gate(self, pool, doc, comments: list[dict]) -> list[dict]:
+        """Batched predicate per comment: is it grounded in the manuscript?
+        Ungrounded comments are dropped before the (strong) validator pass."""
+        if getattr(pool, "decider", None) is None or not comments:
+            return comments
+        from open_referee.providers.decisions import PredicateQuestion
+
+        listing = "\n".join(
+            f"{i}. [{c.get('title', '')[:60]}] quote={(c.get('quote') or '')[:100]} "
+            f"anchor={(c.get('paragraph_anchor') or '')[:80]}"
+            for i, c in enumerate(comments[:60], 1)
+        )
+        qs = [
+            PredicateQuestion(
+                name=f"comment_{i}",
+                instructions=(
+                    f"Review comment {i} quotes or paraphrases text that actually appears "
+                    "in the manuscript (not invented)."
+                ),
+            )
+            for i in range(1, min(len(comments), 60) + 1)
+        ]
+        try:
+            dm = await pool.decide(
+                f"Manuscript: {doc.title}\n\nComments:\n{listing}", qs, call_type="dm_validate"
+            )
+        except LLMError as e:
+            logger.warning("DM validator gate failed (%s); validator handles all", e)
+            return comments
+        kept = []
+        for i, c in enumerate(comments[:60], 1):
+            a = dm.answer(f"comment_{i}")
+            if a is None or a.probability is None or a.probability >= 0.5:
+                kept.append(c)
+        kept.extend(comments[60:])
+        dropped = len(comments) - len(kept)
+        if dropped:
+            await self._emit(
+                Stage.VALIDATE,
+                StageStatus.RUNNING,
+                f"decision gate dropped {dropped} ungrounded comments before validation",
+            )
+        return kept
+
     async def _validate(self, pool, doc, draft: dict) -> dict:
+        gated = await self._dm_validator_gate(pool, doc, list(draft.get("comments", [])))
+        draft = dict(draft, comments=gated)
         user = (
             prompts.VALIDATOR_USER.format(
                 title=doc.title,

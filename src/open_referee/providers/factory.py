@@ -28,6 +28,33 @@ def build_provider(llm_cfg: LLMConfig, role_cfg: RoleConfig) -> ChatProvider:
     return _from_spec(spec)
 
 
+def build_decision_provider(llm_cfg: LLMConfig, role_cfg: RoleConfig):
+    """Resolve the decision role to a DecisionProvider (typed /decisions API)."""
+    from open_referee.providers.decisions import DecisionProvider
+
+    pcfg = llm_cfg.providers.get(role_cfg.provider)
+    if pcfg is None:
+        raise LLMError(
+            f"Decision role references provider '{role_cfg.provider}' which is not "
+            f"defined under llm.providers (available: {sorted(llm_cfg.providers)})"
+        )
+    if pcfg.type is not ProviderType.DECISION:
+        raise LLMError(
+            f"Decision role must bind to a provider of type 'decision' "
+            f"(got '{pcfg.type.value}' for '{role_cfg.provider}')"
+        )
+    if not pcfg.base_url:
+        raise LLMError(f"Decision provider '{role_cfg.provider}' needs a base_url")
+    return DecisionProvider(
+        provider_name=role_cfg.provider,
+        model=role_cfg.model,
+        base_url=pcfg.base_url,
+        api_key=pcfg.resolved_api_key(),
+        timeout_s=llm_cfg.request_timeout_s,
+        max_retries=llm_cfg.max_retries,
+    )
+
+
 def _from_spec(spec: ModelSpec) -> ChatProvider:
     # Local import keeps adapter import costs off the config-only path.
     from open_referee.providers.adapters import (

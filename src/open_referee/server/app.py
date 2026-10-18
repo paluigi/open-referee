@@ -130,6 +130,61 @@ def create_app() -> FastAPI:
         application.state.pipelines[run_id + ":task"] = task  # keep a ref while running
         return {"run_id": run_id}
 
+    @application.post("/api/estimate")
+    async def estimate(paper: UploadFile = File(...), cfg: Config = Depends(get_cfg)):
+        """Mechanical preset estimates for THIS paper: ingest (free) + cost
+        model only — no model is queried. Requires llm.pricing for the
+        configured roles."""
+        import asyncio as _a
+
+        from open_referee.config import ModelRole
+        from open_referee.ingestion import ingest_document
+        from open_referee.pipeline.budget import BudgetHarness, DocumentStats, PricingError
+        from open_referee.pipeline.orchestrator import RolePool
+
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = UPLOAD_DIR / f"est_{uuid.uuid4().hex[:8]}_{_safe_filename(paper.filename)}"
+        tmp.write_bytes(await paper.read())
+        try:
+            doc = await _a.to_thread(ingest_document, tmp)
+            roles = {ModelRole.STRONG, ModelRole.SMALL}
+            try:
+                cfg.llm.role(ModelRole.VISION)
+                roles.add(ModelRole.VISION)
+            except KeyError:
+                pass
+            try:
+                cfg.llm.role(ModelRole.DECISION)
+                roles.add(ModelRole.DECISION)
+            except KeyError:
+                pass
+            pool = RolePool.build(cfg, roles, cap_usd=cfg.review.max_cost_usd)
+            try:
+                harness = BudgetHarness(
+                    cfg,
+                    pool.ledger,
+                    pool.specs,
+                    budget_usd=cfg.review.max_cost_usd,
+                    auto=True,
+                )
+                harness.stats = DocumentStats.from_doc(doc)
+                harness.require_pricing()
+                est = harness.preset_estimates()
+                return {
+                    "ok": True,
+                    "paper": {"title": doc.title, "chars": len(doc.full_text())},
+                    "estimates_usd": est,
+                    "models": {
+                        r.value: f"{p_.provider_name}/{p_.model}" for r, p_ in pool.specs.items()
+                    },
+                }
+            finally:
+                await pool.close()
+        except PricingError as e:
+            return JSONResponse(status_code=422, content={"ok": False, "error": str(e)})
+        finally:
+            tmp.unlink(missing_ok=True)
+
     @application.post("/api/fit")
     async def start_fit(
         paper: UploadFile = File(...),
@@ -174,6 +229,26 @@ def create_app() -> FastAPI:
 
             logging.getLogger(__name__).exception("fit run %s failed", run_id)
 
+    @application.post("/api/reviews/{run_id}/resume")
+    async def resume_review(run_id: str, budget: float = Form(...), cfg: Config = Depends(get_cfg)):
+        """Restart-with-top-up: continue an incomplete run under a new budget;
+        completed stages are reused from the persisted state."""
+        try:
+            state = RunState.load(run_id)
+        except FileNotFoundError:
+            raise HTTPException(404, "run not found") from None
+        if state.status not in ("incomplete", "failed"):
+            raise HTTPException(409, f"run is {state.status}; only incomplete runs resume")
+        pipeline = ReviewPipeline(
+            cfg, run_id=run_id, budget_usd=budget, depth=state.requested_depth or "auto"
+        )
+        application.state.pipelines[run_id] = pipeline
+        task = asyncio.create_task(
+            _run_pipeline(pipeline, state.paper_path, state.literature_paths, run_id)
+        )
+        application.state.pipelines[run_id + ":task"] = task
+        return {"run_id": run_id, "resumed": True, "budget_usd": budget}
+
     @application.get("/api/reviews/{run_id}/events")
     async def events(run_id: str):
         pipeline = application.state.pipelines.get(run_id)
@@ -196,8 +271,15 @@ def create_app() -> FastAPI:
                     terminal = {
                         "run_id": run_id,
                         "stage": "assemble",
-                        "status": "done" if state.status == "completed" else "failed",
-                        "message": state.error or "",
+                        "status": (
+                            "done" if state.status in ("completed", "incomplete") else "failed"
+                        ),
+                        "message": (state.error or "")
+                        + (
+                            f" — incomplete, +${state.shortfall_usd:.2f} estimated to finish"
+                            if state.status == "incomplete" and state.shortfall_usd
+                            else ""
+                        ),
                     }
                     yield await sse(terminal)
                 else:
@@ -216,11 +298,17 @@ def create_app() -> FastAPI:
             #    event because _emit appends before returning).
             for ev in list(pipeline.state.events if pipeline.state else []):
                 yield await sse(ev)
-            if pipeline.state is not None and pipeline.state.status in ("completed", "failed"):
+            if pipeline.state is not None and pipeline.state.status in (
+                "completed",
+                "failed",
+                "incomplete",
+            ):
                 terminal = {
                     "run_id": run_id,
                     "stage": "assemble",
-                    "status": "done" if pipeline.state.status == "completed" else "failed",
+                    "status": (
+                        "done" if pipeline.state.status in ("completed", "incomplete") else "failed"
+                    ),
                     "message": pipeline.state.error or "",
                 }
                 yield await sse(terminal)

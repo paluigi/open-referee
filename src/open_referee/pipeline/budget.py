@@ -236,6 +236,10 @@ class BudgetHarness:
         self._emp_out: dict[str, float] = {}
         # call_type -> units skipped by the affordance gate (for reporting)
         self.gate_stopped: dict[str, int] = {}
+        # observed review yield per call type (findings, max severity) for replans
+        self.yield_data: dict[str, dict] = {}
+        # booked calls that cost >= SPIKE_FACTOR x their estimate
+        self.spike_events: list[dict] = []
 
     # ------------------------------------------------------------ pricing --
 
@@ -258,7 +262,7 @@ class BudgetHarness:
         downstream would silently be zero.
         """
         missing: list[str] = []
-        for role in (ModelRole.STRONG, ModelRole.SMALL, ModelRole.VISION):
+        for role in (ModelRole.STRONG, ModelRole.SMALL, ModelRole.VISION, ModelRole.DECISION):
             if role not in self.specs:
                 continue
             spec = self.specs[role]
@@ -323,6 +327,10 @@ class BudgetHarness:
                 return ("strong", m + 2000, 3000)
             case "planner":
                 return ("small", 6000, 1200)
+            case "wrapup":
+                return ("strong", m + 80_000 // CHARS_PER_TOKEN + 1500, 4000)
+            case "dm_call":
+                return ("decision", 5000, 1)
         return ("small", 4000, 1500)
 
     def unit_cost(self, ct: str) -> float:
@@ -553,6 +561,7 @@ class BudgetHarness:
             rec.output_tokens if n == 0 else (1 - a) * self._emp_out[ct] + a * rec.output_tokens
         )
         self.done[ct] = n + 1
+        self._detect_spike(rec)
 
     def actual_cost(self) -> float:
         return self.ledger.total_cost()
@@ -604,20 +613,21 @@ class BudgetHarness:
     # ---------------------------------------------------------- steering --
 
     def should_replan(self) -> str | None:
-        """Reason string when an LLM replan is warranted, else None.
+        """Reason string when a replan is warranted, else None.
 
-        Gated: only in auto mode, only while planner calls remain, only when
-        the deviation is material (avoids the overspend -> replan -> overspend
-        loop — replanning itself costs budget)."""
+        Gated: only in auto mode, and only on material deviation — the
+        replan COUNT is deliberately unbounded (project-owner decision);
+        anti-thrash comes from the deviation thresholds and the fact that
+        every committee call draws from the same budget."""
         if not self.auto or self.plan is None:
-            return None
-        if self.plan.planner_calls_used >= self.plan.planner_calls_max:
             return None
         proj = self.projected_final()
         if proj > OVERRUN_BUDGET_FRACTION * self.budget_usd:
             return "projected overrun of the budget"
         if proj > (1 + TARGET_TOLERANCE) * self.plan.target_usd:
             return "projected spend exceeds the soft target by more than 20%"
+        if self.spike_events:
+            return "an unexpectedly expensive call was booked (spike)"
         return None
 
     def repair_options(self) -> list[RepairOption]:
@@ -752,8 +762,9 @@ class BudgetHarness:
 
     def allow_call(self, ct: str) -> bool:
         """Fan-out gate: can we afford one more unit of this call type while
-        keeping the projection under the hard budget?"""
-        if self.plan is None:
+        keeping the projection under the hard budget? Preset mode is uncapped
+        by design, so its gate is always open."""
+        if not self.auto or self.plan is None:
             return True
         return self.projected_final() + self.unit_cost(ct) <= self.budget_usd
 
@@ -789,3 +800,502 @@ class BudgetHarness:
                 "Returning action='noop' when things are on track is free of regret."
             ),
         }
+
+    # ---------------------------------------------- frontier & replanning --
+
+    def wrapup_reserve(self) -> float:
+        """Cost kept aside so an incomplete review can always be wrapped up
+        by a model call (strong, manuscript + findings as context)."""
+        if not self.auto:
+            return 0.0
+        return round(self.unit_cost("wrapup"), 6)
+
+    def effective_budget(self) -> float:
+        return self.budget_usd - self.wrapup_reserve()
+
+    def preset_estimates(self) -> dict[str, float]:
+        out = {}
+        for name, knobs in PRESET_KNOBS.items():
+            control, stages = self._estimates_for(knobs)
+            out[name] = round(sum(e.est_cost_usd for e in {**control, **stages}.values()), 6)
+        return out
+
+    def fast_floor(self) -> float:
+        return self.preset_estimates()["fast"]
+
+    def frontier(self, limit: int = 10) -> list[FrontierPath]:
+        """Deterministic feasible-by-construction menu for the committee.
+        Every returned path fits the (reserve-adjusted) budget."""
+        cap = self.effective_budget()
+        total_claims = self.stats.known_or_estimated_claims
+        out: list[FrontierPath] = []
+        for name, desc, knobs in FRONTIER_ARCHETYPES:
+            k = knobs.model_copy(update={"max_claims": min(knobs.max_claims, total_claims)})
+            if (
+                k.max_claims < knobs.max_claims
+                and knobs.max_claims > 0
+                and name
+                not in (
+                    "fast-scan",
+                    "triage-plus-lenses",
+                )
+            ):
+                # rename to reflect the actual claim count when capped
+                desc = desc.replace("Top-50", f"Top-{k.max_claims}").replace(
+                    "All claims", f"Top-{k.max_claims} claims"
+                )
+            cost = self._cost_of(k)
+            if cost <= cap:
+                out.append(
+                    FrontierPath(
+                        name=name,
+                        description=desc,
+                        knobs=k,
+                        est_cost_usd=round(cost, 6),
+                        claims_count=k.max_claims,
+                        passes=_passes_of(k),
+                    )
+                )
+        # keep diversity: sort by cost, cap the list
+        out.sort(key=lambda p: p.est_cost_usd)
+        if len(out) > limit:
+            # evenly spaced selection that always keeps the extremes
+            idx = [round(i * (len(out) - 1) / (limit - 1)) for i in range(limit)]
+            out = [out[i] for i in dict.fromkeys(idx)]
+        return out
+
+    def path_to_plan(self, path: FrontierPath, reason: str, rationale: str = "") -> ReviewPlan:
+        """Commit a frontier path: feasible by construction, recomputed costs."""
+        control, stages = self._estimates_for(path.knobs)
+        plan = ReviewPlan(
+            budget_usd=self.budget_usd,
+            target_usd=round(path.est_cost_usd, 4),
+            knobs=path.knobs,
+            control_estimates=control,
+            stage_estimates=stages,
+            # no numeric cap on replans (project-owner decision); the counter
+            # still tracks how many committee calls were spent
+            planner_calls_max=10_000,
+            planner_calls_used=(self.plan.planner_calls_used if self.plan else 0),
+            rationale=rationale or f"frontier path '{path.name}': {path.description}",
+            based_on="frontier",
+        )
+        plan.adjustments.append(
+            PlanAdjustment(
+                reason=reason,
+                action=f"frontier:{path.name}",
+                detail=path.description,
+                source="committee",
+            )
+        )
+        self.set_plan(plan, reason=f"frontier:{path.name}")
+        return plan
+
+    def apply_residual(self, path: ResidualPath, reason: str) -> ReviewPlan:
+        """Commit a replan continuation: knobs applied, costs recomputed by
+        the cost model (feasible by construction — built from the residual)."""
+        control, stages = self._estimates_for(path.knobs)
+        plan = ReviewPlan(
+            budget_usd=self.budget_usd,
+            target_usd=round(self.actual_cost() + self._remaining_cost(path.knobs), 4),
+            knobs=path.knobs,
+            control_estimates=control,
+            stage_estimates=stages,
+            planner_calls_max=10_000,
+            planner_calls_used=(self.plan.planner_calls_used if self.plan else 0),
+            rationale=f"continuation '{path.name}': {path.description}",
+            based_on="residual-frontier",
+        )
+        plan.adjustments.append(
+            PlanAdjustment(
+                reason=reason,
+                action=f"continuation:{path.name}",
+                detail=path.description,
+                source="committee",
+            )
+        )
+        self.set_plan(plan, reason=f"continuation:{path.name}")
+        return plan
+
+    def _remaining_cost(self, knobs: PlanKnobs) -> float:
+        """Cost of the calls still to be made under these knobs, given what
+        is already done (per call type)."""
+        control, stages = self._estimates_for(knobs)
+        est = {**control, **stages}
+        remaining = 0.0
+        for ct, e in est.items():
+            n = max(0, e.calls - self.done.get(ct, 0))
+            if n:
+                remaining += n * self.unit_cost(ct)
+        return remaining
+
+    def residual_frontier(self, limit: int = 5) -> list[ResidualPath]:
+        """4-5 continuation plans built from residual steps + residual budget.
+        Feasible by construction: actual + remaining <= budget - wrapup reserve."""
+        if self.plan is None:
+            return []
+        cap = self.effective_budget()
+        actual = self.actual_cost()
+        cur = self.plan.knobs
+        verified = self.done.get("claim_verify", 0)
+        remaining_now = max(0, min(cur.max_claims, self.stats.known_or_estimated_claims) - verified)
+
+        def variant(name, desc, knobs) -> ResidualPath | None:
+            proj = actual + self._remaining_cost(knobs)
+            if proj > cap:
+                return None
+            extra_claims = max(
+                0, min(knobs.max_claims, self.stats.known_or_estimated_claims) - verified
+            )
+            passes = [p for p in _passes_of(knobs) if p not in _passes_of(cur)] or [
+                "finish current passes"
+            ]
+            return ResidualPath(
+                name=name,
+                description=desc,
+                knobs=knobs,
+                projected_final_usd=round(proj, 6),
+                claims_remaining=extra_claims,
+                passes_remaining=passes,
+            )
+
+        candidates = [
+            ("continue", "Continue the current plan as-is", cur),
+            (
+                "trim-claims",
+                f"Verify ~half of the {remaining_now} remaining claims "
+                "(least important dropped first)",
+                cur.model_copy(update={"max_claims": verified + max(0, remaining_now // 2)}),
+            ),
+            (
+                "stop-claims-hold-breadth",
+                "Stop new claim verification; keep the planned breadth passes",
+                cur.model_copy(update={"max_claims": verified}),
+            ),
+            (
+                "drop-defense",
+                "Keep claims; skip the defense/adjudication gate",
+                cur.model_copy(update={"defense_round": False}),
+            ),
+            (
+                "lean-finish",
+                "Stop claims and breadth; challenger + meta + validation only",
+                cur.model_copy(
+                    update={
+                        "max_claims": verified,
+                        "per_section_lenses": False,
+                        "whole_paper_passes": False,
+                        "defense_round": False,
+                        "max_artifacts": 0,
+                    }
+                ),
+            ),
+        ]
+        # quality-ordered: keep the best feasible ones
+        out = []
+        for name, desc, knobs in candidates:
+            v = variant(name, desc, knobs)
+            if v is not None:
+                out.append(v)
+        # 'continue' first if feasible, else ordered by least cutting
+        priority = {
+            "continue": 0,
+            "trim-claims": 1,
+            "stop-claims-hold-breadth": 2,
+            "drop-defense": 3,
+            "lean-finish": 4,
+        }
+        out.sort(key=lambda p: priority.get(p.name, 9))
+        return out[:limit]
+
+    def cheapest_completion_cost(self) -> float:
+        """Cost of the cheapest possible completion (lean-finish continuation)."""
+        if self.plan is None:
+            return 0.0
+        verified = self.done.get("claim_verify", 0)
+        lean = self.plan.knobs.model_copy(
+            update={
+                "max_claims": verified,
+                "per_section_lenses": False,
+                "whole_paper_passes": False,
+                "defense_round": False,
+                "max_artifacts": 0,
+            }
+        )
+        return self.actual_cost() + self._remaining_cost(lean)
+
+    def shortfall(self) -> float:
+        """Additional budget needed to complete even the cheapest continuation."""
+        if self.plan is None:
+            return 0.0
+        return round(max(0.0, self.cheapest_completion_cost() - self.effective_budget()), 6)
+
+    def note_yield(self, call_type: str, findings: int, max_severity: float = 0.0) -> None:
+        agg = self.yield_data.setdefault(
+            call_type, {"findings": 0, "max_severity": 0.0, "units": 0}
+        )
+        agg["findings"] += findings
+        agg["max_severity"] = max(agg["max_severity"], max_severity)
+        agg["units"] += 1
+
+    def _detect_spike(self, rec: CallRecord) -> None:
+        if rec.call_type in CONTROL_TYPES or rec.call_type.startswith("dm_"):
+            return
+        est = self.unit_cost(rec.call_type)
+        if est > 0 and rec.estimated_cost_usd >= SPIKE_FACTOR * est:
+            self.spike_events.append(
+                {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "call_type": rec.call_type,
+                    "estimated_unit_usd": round(est, 6),
+                    "actual_usd": round(rec.estimated_cost_usd, 6),
+                }
+            )
+
+    def consume_spike(self) -> dict | None:
+        """Return and clear the pending spike (checked at every checkpoint)."""
+        if self.spike_events:
+            return self.spike_events[-1]
+        return None
+
+    def replan_context(self, paths: list[ResidualPath] | None = None) -> dict:
+        st = self.status()
+        return {
+            "budget_usd": st["budget_usd"],
+            "target_usd": st["target_usd"],
+            "spent_usd": st["actual_usd"],
+            "projected_final_usd": st["projected_final_usd"],
+            "residual_budget_usd": round(self.effective_budget() - st["actual_usd"], 6),
+            "coverage": {
+                "claims_planned": (
+                    min(self.plan.knobs.max_claims, self.stats.known_or_estimated_claims)
+                    if self.plan
+                    else 0
+                ),
+                "claims_verified": self.done.get("claim_verify", 0),
+                "claims_remaining": max(
+                    0,
+                    (
+                        min(self.plan.knobs.max_claims, self.stats.known_or_estimated_claims)
+                        if self.plan
+                        else 0
+                    )
+                    - self.done.get("claim_verify", 0),
+                ),
+            },
+            "observed_yield": dict(self.yield_data),
+            "gate_stops": dict(self.gate_stopped),
+            "spikes": list(self.spike_events[-3:]),
+            "unit_costs_usd": {ct: round(self.unit_cost(ct), 6) for ct in REVIEW_TYPES},
+            "residual_paths": [p.model_dump() for p in (paths if paths is not None else [])],
+            "rules": (
+                "Choose the continuation that maximizes review value within the "
+                "residual budget. Depth = more claims verified; breadth = more "
+                "passes. Use observed yield: keep spending where findings emerge, "
+                "cut where they do not."
+            ),
+        }
+
+
+# ------------------------------------------------------------------ frontier --
+
+DEPTH_LEVELS = (0, 10, 25, 50, 150)  # claim counts by importance rank (capped)
+
+PRESET_KNOBS: dict[str, PlanKnobs] = {
+    "fast": PlanKnobs(
+        max_claims=20,
+        per_section_lenses=False,
+        whole_paper_passes=True,
+        defense_round=False,
+        max_artifacts=6,
+    ),
+    "standard": PlanKnobs(),
+    "deep": PlanKnobs(
+        max_claims=150,
+        per_section_lenses=True,
+        whole_paper_passes=True,
+        defense_round=True,
+        max_artifacts=25,
+    ),
+}
+
+# (name, description, knobs) — ~14 archetypes over the two axes; the frontier
+# keeps the ~10 most diverse FEASIBLE ones for the committee.
+FRONTIER_ARCHETYPES: list[tuple[str, str, PlanKnobs]] = [
+    (
+        "fast-scan",
+        "No claim verification; whole-paper coherence pass only",
+        PlanKnobs(
+            max_claims=0,
+            per_section_lenses=False,
+            whole_paper_passes=True,
+            defense_round=False,
+            max_artifacts=0,
+        ),
+    ),
+    (
+        "lean-core",
+        "Minimal meaningful: 6 central claims, no extras",
+        PlanKnobs(
+            max_claims=MIN_CLAIMS,
+            per_section_lenses=False,
+            whole_paper_passes=False,
+            defense_round=False,
+            max_artifacts=0,
+        ),
+    ),
+    (
+        "claims-light",
+        "Top-10 claims + whole-paper pass",
+        PlanKnobs(
+            max_claims=10,
+            per_section_lenses=False,
+            whole_paper_passes=True,
+            defense_round=False,
+            max_artifacts=0,
+        ),
+    ),
+    (
+        "claims-standard",
+        "Top-25 claims + whole-paper pass",
+        PlanKnobs(
+            max_claims=25,
+            per_section_lenses=False,
+            whole_paper_passes=True,
+            defense_round=False,
+            max_artifacts=0,
+        ),
+    ),
+    (
+        "claims-deep",
+        "Top-50 claims + whole-paper pass + defense gate",
+        PlanKnobs(
+            max_claims=50,
+            per_section_lenses=False,
+            whole_paper_passes=True,
+            defense_round=True,
+            max_artifacts=0,
+        ),
+    ),
+    (
+        "claims-max",
+        "All claims + whole-paper pass + defense gate (depth-maximal)",
+        PlanKnobs(
+            max_claims=150,
+            per_section_lenses=False,
+            whole_paper_passes=True,
+            defense_round=True,
+            max_artifacts=0,
+        ),
+    ),
+    (
+        "balanced",
+        "Top-25 claims + lenses + whole-paper + defense + some artifacts",
+        PlanKnobs(
+            max_claims=25,
+            per_section_lenses=True,
+            whole_paper_passes=True,
+            defense_round=True,
+            max_artifacts=6,
+        ),
+    ),
+    (
+        "breadth-standard",
+        "Top-15 claims + full breadth (lenses, whole-paper, artifacts, defense)",
+        PlanKnobs(
+            max_claims=15,
+            per_section_lenses=True,
+            whole_paper_passes=True,
+            defense_round=True,
+            max_artifacts=12,
+        ),
+    ),
+    (
+        "breadth-max",
+        "Top-10 claims + maximal breadth passes",
+        PlanKnobs(
+            max_claims=10,
+            per_section_lenses=True,
+            whole_paper_passes=True,
+            defense_round=True,
+            max_artifacts=25,
+        ),
+    ),
+    (
+        "deep-plus",
+        "Top-50 claims + full breadth + defense",
+        PlanKnobs(
+            max_claims=50,
+            per_section_lenses=True,
+            whole_paper_passes=True,
+            defense_round=True,
+            max_artifacts=12,
+        ),
+    ),
+    (
+        "maximal",
+        "Everything that fits: all claims, all passes",
+        PlanKnobs(
+            max_claims=150,
+            per_section_lenses=True,
+            whole_paper_passes=True,
+            defense_round=True,
+            max_artifacts=25,
+        ),
+    ),
+    (
+        "triage-plus-lenses",
+        "No claims; lenses + whole-paper (pure breadth)",
+        PlanKnobs(
+            max_claims=0,
+            per_section_lenses=True,
+            whole_paper_passes=True,
+            defense_round=False,
+            max_artifacts=6,
+        ),
+    ),
+]
+
+
+class FrontierPath(BaseModel):
+    """One feasible-by-construction plan option on the depth×breadth axes."""
+
+    name: str
+    description: str
+    knobs: PlanKnobs
+    est_cost_usd: float
+    claims_count: int  # ranked claims verified under this path
+    passes: list[str] = Field(default_factory=list)  # breadth passes included
+
+    def menu_line(self) -> str:
+        return (
+            f"{self.name}: {self.description} — approx ${self.est_cost_usd:.4f} "
+            f"({self.claims_count} claims; passes: {', '.join(self.passes) or 'none'})"
+        )
+
+
+def _passes_of(knobs: PlanKnobs) -> list[str]:
+    passes = []
+    if knobs.per_section_lenses:
+        passes.append("section-lenses")
+    if knobs.whole_paper_passes:
+        passes.append("whole-paper")
+    if knobs.max_artifacts > 0:
+        passes.append(f"artifacts≤{knobs.max_artifacts}")
+    if knobs.defense_round:
+        passes.append("defense-gate")
+    return passes
+
+
+class ResidualPath(BaseModel):
+    """A continuation option at replan time: feasible w.r.t. residual budget."""
+
+    name: str
+    description: str
+    knobs: PlanKnobs  # the plan knobs AFTER applying this continuation
+    projected_final_usd: float  # actual + remaining under these knobs
+    claims_remaining: int  # additional claims verified if followed
+    passes_remaining: list[str] = Field(default_factory=list)
+
+
+SPIKE_FACTOR = 8.0  # a call costing >= 8x its estimate is a spike

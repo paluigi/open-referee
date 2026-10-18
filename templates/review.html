@@ -16,6 +16,24 @@
   <main x-data="{ tab: 'overall' }">
     <h1>{{ state.paper_title or run_id }} <span class="pill pill-{{ state.status }}">{{ state.status }}</span></h1>
 
+    {% if state.status == 'incomplete' %}
+    <section class="card">
+      <h2>⚠️ Incomplete review</h2>
+      <p>{{ state.error or 'The run ran out of budget before completing all stages.' }}</p>
+      {% if state.shortfall_usd %}
+      <p>Estimated additional budget to finish: <strong>${{ '%.2f'|format(state.shortfall_usd) }}</strong></p>
+      {% endif %}
+      <form hx-post="/api/reviews/{{ run_id }}/resume" hx-target="#resume-result" class="inline-form">
+        <label>Resume with budget (USD)
+          <input type="number" name="budget" step="0.5" min="0"
+                 value="{{ '%.2f'|format((state.shortfall_usd or 0.5) * 2.5) }}" required>
+        </label>
+        <button type="submit">Resume run</button>
+      </form>
+      <div id="resume-result"></div>
+      <p class="muted small">Completed stages are reused — the run continues from where it stopped.</p>
+    </section>
+    {% endif %}
     {% if report and state.run_type == 'fit' %}
     <div class="tabs">
       <a class="btn" href="/api/reviews/{{ run_id }}/report.pdf">PDF</a>
@@ -28,15 +46,17 @@
       <p><strong>{{ '%.0f'|format(report.probability_not_desk_rejected * 100) }}%</strong>
         (calibrated decision model){% if report.llm_holistic_estimate is not none %} ·
         LLM holistic estimate: <strong>{{ '%.0f'|format(report.llm_holistic_estimate * 100) }}%</strong>{% endif %}</p>
-      <p class="muted small">Calibration: sigmoid({{ report.calibration.get('bias', -3.6) }} + Σ weight·score);
-        weights are shown per factor below.</p>
+      {% if report.decision %}
+      <p class="muted small">Verdict by {{ "decision model over the editor's factor analyses"
+        if report.decision.source == 'decision-model' else "LLM fallback (no decision model configured)" }}
+        {% if report.decision.confidence is not none %} · confidence {{ '%.2f'|format(report.decision.confidence) }}{% endif %}</p>
+      {% endif %}
 
       <h2>Factor assessment</h2>
       {% for f in report.factors %}
-      <article class="comment sev-{{ 'high' if f.score < 0.4 else 'mid' if f.score < 0.7 else 'low' }}">
-        <h3>{{ f.label }} — {{ '%.2f'|format(f.score) }} <span class="pill">w {{ report.calibration.get(f.name, 0) }}</span></h3>
-        {% if f.evidence %}<blockquote>{{ f.evidence }}</blockquote>{% endif %}
-        <p>{{ f.rationale }}</p>
+      <article class="comment">
+        <h3>{{ f.label }}</h3>
+        <p>{{ f.analysis }}</p>
       </article>
       {% endfor %}
 

@@ -76,11 +76,17 @@ async def run_claim_inventory(
 async def verify_claims(
     pipeline, pool: RolePool, doc: Document, claims: list[dict], cfg: Config
 ) -> list[dict]:
-    """Per-claim verification workers, parallel with the configured cap."""
+    """Per-claim verification workers, parallel with the configured cap.
+
+    When the committee already importance-ranked the claims (auto mode), the
+    given order is authoritative; otherwise the inventory's coarse importance
+    sorts the queue (central first)."""
     knobs = pipeline.plan_knobs()
-    # central claims first, then supporting; peripheral only if budget remains
-    order = {"central": 0, "supporting": 1, "peripheral": 2}
-    ordered = sorted(claims, key=lambda c: order.get(str(c.get("importance")).lower(), 1))
+    if getattr(pipeline, "_claims_ranked", False):
+        ordered = list(claims)
+    else:
+        order = {"central": 0, "supporting": 1, "peripheral": 2}
+        ordered = sorted(claims, key=lambda c: order.get(str(c.get("importance")).lower(), 1))
     selected = ordered[: knobs.max_claims]
 
     sem = asyncio.Semaphore(cfg.review.max_parallel_calls)
@@ -116,6 +122,17 @@ async def verify_claims(
             for c in comments:
                 c.setdefault("paragraph_anchor", claim.get("anchor", ""))
                 c["claim_id"] = claim.get("id")
+            # observed yield feeds the replanning committee
+            h = getattr(pool, "harness", None)
+            if h is not None and comments:
+                try:
+                    h.note_yield(
+                        "claim_verify",
+                        len(comments),
+                        max((float(c.get("score", 0)) for c in comments), default=0.0),
+                    )
+                except (TypeError, ValueError):
+                    pass
             await pipeline._emit(
                 Stage.VERIFY, StageStatus.RUNNING, f"claim {claim.get('id')} [{ctype}] verified"
             )
@@ -281,15 +298,168 @@ def _near_page_blocks(doc: Document, page: int | None, window: int = 6) -> list[
 async def defense_round(
     pipeline, pool: RolePool, doc: Document, candidates: list[dict], cfg: Config
 ) -> list[dict]:
-    """Per-comment quality gate: authors' defense -> adjudication.
+    """Per-comment quality gate: authors' defense (small LLM) -> verdict.
 
-    Only for comments whose anchor resolves to document text (unanchored ones
-    go straight to the meta-reviewer, which re-checks them globally).
+    With a decision model configured, verdicts + recalibrated severity are
+    BATCHED decision questions (uphold/adjust/dismiss + severity rubric) in
+    one call over all comments; an LLM rewrites only 'adjust' comments.
+    Without one, the strong-model adjudicator adjudicates per comment.
+    Gate failures never drop a comment.
     """
     knobs = pipeline.plan_knobs()
     if not knobs.defense_round or not candidates:
         return list(candidates)
 
+    if getattr(pool, "decider", None) is not None:
+        return await _defense_round_dm(pipeline, pool, doc, candidates, cfg)
+    return await _defense_round_llm(pipeline, pool, doc, candidates, cfg)
+
+
+async def _defense_defense_texts(
+    pipeline, pool: RolePool, doc: Document, candidates: list[dict], cfg: Config
+) -> list[str]:
+    """Authors' best honest defense per comment (small model), in parallel."""
+    sem = asyncio.Semaphore(cfg.review.max_parallel_calls)
+
+    async def one(c: dict) -> str:
+        async with sem:
+            if not pipeline.budget_allows("defense"):
+                pipeline._note_gate_stop("defense")
+                return "(no defense drafted — budget gate)"
+            anchor = c.get("paragraph_anchor") or c.get("quote") or ""
+            passage = _passage_for(doc, anchor) or "(anchor not found in document)"
+            try:
+                defense = await pool.complete_json(
+                    ModelRole.SMALL,
+                    prompts_claims.DEFENSE_SYSTEM,
+                    prompts_claims.DEFENSE_USER.format(
+                        title=c.get("title", ""),
+                        quote=(c.get("quote") or "")[:600],
+                        message=(c.get("message") or "")[:1500],
+                        passage=passage[:2500],
+                    ),
+                    call_type="defense",
+                )
+                return (
+                    f"[{defense.get('defense_strength', 'unknown')}] "
+                    + (defense.get("defense") or "")[:1200]
+                )
+            except Exception as e:
+                logger.warning("defense drafting failed for %s: %s", c.get("title"), e)
+                return "(defense drafting failed)"
+
+    return list(await asyncio.gather(*(one(c) for c in candidates)))
+
+
+async def _defense_round_dm(
+    pipeline, pool: RolePool, doc: Document, candidates: list[dict], cfg: Config
+) -> list[dict]:
+    """Decision-model adjudication: batched verdicts + severity, one call."""
+    from open_referee.providers.decisions import ChoiceQuestion, ScoreQuestion
+
+    defenses = await _defense_defense_texts(pipeline, pool, doc, candidates, cfg)
+    listing = "\n".join(
+        f"{i}. [{c.get('title', '')[:70]}] severity={c.get('score')} "
+        f"message={(c.get('message') or '')[:400]}\n   defense: {defenses[i - 1][:400]}"
+        for i, c in enumerate(candidates, 1)
+    )
+    n = len(candidates)
+    questions = []
+    for i in range(1, n + 1):
+        questions.append(
+            ChoiceQuestion(
+                name=f"verdict_{i}",
+                instructions=(
+                    f"Adjudicate comment {i} after reading its authors' defense. "
+                    "dismiss = the defense refutes it; adjust = partially right, "
+                    "severity or wording needs correction; uphold = it stands."
+                ),
+                choices=[{"value": v} for v in ("uphold", "adjust", "dismiss")],
+            )
+        )
+        questions.append(
+            ScoreQuestion(
+                name=f"severity_{i}",
+                instructions=f"Recalibrated severity for comment {i} (if it stands).",
+                levels=[
+                    {"label": "polish", "description": "0.1-0.34"},
+                    {"label": "minor", "description": "0.35-0.59"},
+                    {"label": "major", "description": "0.6-0.79"},
+                    {"label": "invalidating", "description": "0.8-1.0"},
+                ],
+            )
+        )
+    try:
+        dm = await pool.decide(
+            f"Manuscript: {doc.title}\n\nComments with defenses:\n\n{listing}"[:60_000],
+            questions,
+            call_type="dm_defense",
+        )
+    except Exception as e:
+        logger.warning("DM adjudication failed (%s); all comments upheld", e)
+        return list(candidates)
+
+    sev_map = {"polish": 0.25, "minor": 0.45, "major": 0.7, "invalidating": 0.9}
+    kept: list[dict] = []
+    to_adjust: list[tuple[int, dict]] = []
+    for i, c in enumerate(candidates, 1):
+        v = dm.answer(f"verdict_{i}")
+        verdict = v.choice if v and v.choice else "uphold"
+        if verdict == "dismiss":
+            continue
+        cc = dict(c)
+        sv = dm.answer(f"severity_{i}")
+        if sv is not None and sv.probabilities:
+            best = max(sv.probabilities, key=lambda d: d.get("probability", 0))
+            label = best.get("label")
+            if label in sev_map:
+                cc["score"] = sev_map[label]
+        if verdict == "adjust":
+            to_adjust.append((i, cc))
+        else:
+            kept.append(cc)
+
+    # LLM rewrites only the adjusted comments (usually few)
+    for i, cc in to_adjust:
+        try:
+            rewrite = await pool.complete_json(
+                ModelRole.SMALL,
+                prompts_claims.ADJUDICATION_SYSTEM,
+                prompts_claims.ADJUDICATION_USER.format(
+                    title=cc.get("title", ""),
+                    quote=(cc.get("quote") or "")[:600],
+                    message=(cc.get("message") or "")[:1500],
+                    score=cc.get("score"),
+                    defense_strength="adjusted by decision model",
+                    defense=defenses[i - 1][:2000],
+                    passage=(_passage_for(doc, cc.get("paragraph_anchor") or "") or "")[:2500],
+                ),
+                call_type="adjudication",
+            )
+            final = rewrite.get("comment")
+            if isinstance(final, dict) and final.get("message"):
+                merged = {k: v for k, v in cc.items() if k not in final}
+                merged.update(final)
+                kept.append(merged)
+            else:
+                kept.append(cc)
+        except Exception as e:
+            logger.warning("adjust rewrite failed for %s: %s", cc.get("title"), e)
+            kept.append(cc)
+
+    await pipeline._emit(
+        Stage.CHALLENGE,
+        StageStatus.RUNNING,
+        f"defense gate (decision model): {len(kept)}/{len(candidates)} comments upheld "
+        f"({len(to_adjust)} adjusted)",
+    )
+    return kept
+
+
+async def _defense_round_llm(
+    pipeline, pool: RolePool, doc: Document, candidates: list[dict], cfg: Config
+) -> list[dict]:
+    """Strong-model per-comment adjudication (no decision model configured)."""
     sem = asyncio.Semaphore(cfg.review.max_parallel_calls)
 
     async def gate(c: dict) -> dict | None:

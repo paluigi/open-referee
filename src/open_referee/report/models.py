@@ -73,13 +73,21 @@ class ReviewReport(BaseModel):
 
 
 class FitFactor(BaseModel):
-    """One scored dimension of the journal-fit assessment."""
+    """One dimension of the journal-fit assessment: the LLM editor's textual
+    analysis (capped for brevity), which the decision model then judges."""
 
     name: str  # machine name, e.g. scope_fit
     label: str  # human label, e.g. "Scope fit"
-    score: float = Field(ge=0.0, le=1.0)  # 1 = strong fit with the venue
-    rationale: str = ""
-    evidence: str | None = None  # quote from manuscript or profile
+    analysis: str = ""  # the editor's reasoning, ~500-600 tokens max
+
+
+class FitDecision(BaseModel):
+    """The decision model's verdict over the LLM's factor analyses."""
+
+    probability: float = Field(ge=0.0, le=1.0)  # P(pass the desk screen)
+    confidence: float | None = None
+    question: str = ""
+    source: str = "decision-model"  # decision-model | llm-fallback
 
 
 class FitReport(BaseModel):
@@ -87,10 +95,9 @@ class FitReport(BaseModel):
     paper_title: str
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     journal_profile: str = ""  # the free-form venue description, echoed
-    probability_not_desk_rejected: float = Field(ge=0.0, le=1.0)
-    llm_holistic_estimate: float | None = Field(default=None, ge=0.0, le=1.0)
+    decision: FitDecision | None = None
+    probability_not_desk_rejected: float = Field(default=0.0, ge=0.0, le=1.0)
     factors: list[FitFactor] = Field(default_factory=list)
-    calibration: dict[str, float] = Field(default_factory=dict)  # weights actually used
     reasoning: str = ""  # markdown
     risks: list[str] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)

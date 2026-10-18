@@ -63,8 +63,9 @@ class RunState(BaseModel):
     events: list[StageEvent] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    status: str = "running"  # running | completed | failed
+    status: str = "running"  # running | completed | failed | incomplete
     error: str | None = None
+    shortfall_usd: float | None = None  # set when a run wraps up incomplete
     # product + budget context for the run
     run_type: str = "review"  # review | fit
     requested_depth: str | None = None  # per-run depth override (auto/fast/standard/deep)
