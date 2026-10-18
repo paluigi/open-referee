@@ -319,6 +319,9 @@ class ReviewPipeline:
                 lambda: self._literature(pool, doc, triage, queries, key_citations, lit_docs),
                 skip_key="survey",
             )
+            if isinstance(pack, dict):
+                # resumed runs load artifacts as JSON: rebuild the ContextPack
+                pack = ContextPack.model_validate(pack)
             await self._stage_or_resume(
                 Stage.SCOUT, lambda: self._scout(pool, doc.title, key_citations, pack)
             )
