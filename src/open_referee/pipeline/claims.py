@@ -446,14 +446,30 @@ async def defense_round(
     one call over all comments; an LLM rewrites only 'adjust' comments.
     Without one, the strong-model adjudicator adjudicates per comment.
     Gate failures never drop a comment.
+
+    Deep plans (defense_second_round) run the whole gate a second time over
+    the survivors: only comments that withstand two independent adversarial
+    rounds reach the report, with the second round's severity verdict final.
     """
     knobs = pipeline.plan_knobs()
     if not knobs.defense_round or not candidates:
         return list(candidates)
 
     if getattr(pool, "decider", None) is not None:
-        return await _defense_round_dm(pipeline, pool, doc, candidates, cfg)
-    return await _defense_round_llm(pipeline, pool, doc, candidates, cfg)
+        out = await _defense_round_dm(pipeline, pool, doc, candidates, cfg)
+    else:
+        out = await _defense_round_llm(pipeline, pool, doc, candidates, cfg)
+    if getattr(knobs, "defense_second_round", False) and out and len(out) < len(candidates):
+        await pipeline._emit(
+            Stage.CHALLENGE,
+            StageStatus.RUNNING,
+            f"second defense round on {len(out)} upheld comments",
+        )
+        if getattr(pool, "decider", None) is not None:
+            out = await _defense_round_dm(pipeline, pool, doc, out, cfg)
+        else:
+            out = await _defense_round_llm(pipeline, pool, doc, out, cfg)
+    return out
 
 
 async def _defense_defense_texts(

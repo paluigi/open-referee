@@ -49,6 +49,7 @@ STAGE_OF_CALL_TYPE: dict[str, str] = {
     "adjudication": "challenge",
     "bibliography": "bibliography",
     "meta": "meta",
+    "synthesis": "meta",
     "validate": "validate",
     "fit_assessment": "fit",
 }

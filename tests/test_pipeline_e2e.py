@@ -161,6 +161,7 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
             )
         )
     strong.queue(overall_json())
+    strong.queue(json.dumps({"overall_feedback": "## Synth"}))  # synthesis
     strong.queue(validator_json())
 
     events: list = []
@@ -322,6 +323,7 @@ async def test_auto_mode_budget_driven_e2e(test_config, sample_paper_file, monke
             )
         )
     strong.queue(overall_json())
+    strong.queue(json.dumps({"overall_feedback": "## Synth"}))  # synthesis
     strong.queue(validator_json())
 
     report = await pipeline.run(sample_paper_file)
@@ -492,6 +494,7 @@ async def test_resume_restores_spend_accounting(
             )
         )
     strong.queue(overall_json())
+    strong.queue(json.dumps({"overall_feedback": "## Synth"}))  # synthesis
     strong.queue(validator_json())
 
     report1 = await pipeline.run(sample_paper_file)

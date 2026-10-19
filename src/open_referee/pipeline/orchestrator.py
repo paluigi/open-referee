@@ -976,8 +976,11 @@ class ReviewPipeline:
             lenses.append(("math", prompts.MATH_VERIFIER_SYSTEM))
         if stat_content not in ("", "none") or "empirical" in style or "causal" in stat_content:
             lenses.append(("empirical", prompts.EMPIRICAL_VERIFIER_SYSTEM))
-        # literature coherence always runs: cheap and central to the review
+        if stat_content not in ("", "none") or "empirical" in style:
+            lenses.append(("stats", prompts.STATS_VERIFIER_SYSTEM))
+        # literature coherence + clarity always run: cheap and central to the review
         lenses.append(("lit", prompts.LIT_VERIFIER_SYSTEM))
+        lenses.append(("clarity", prompts.CLARITY_VERIFIER_SYSTEM))
         return lenses
 
     async def _verify(
@@ -1278,61 +1281,141 @@ class ReviewPipeline:
                 )
         return _render_resolutions(records)
 
+    def _checker_comments(self) -> list[dict]:
+        """Deterministic checker findings as candidate comments: they join the
+        stream at meta (after defense, before validation) with their
+        provenance kept — mechanical findings skip the author-defense gate."""
+        out: list[dict] = []
+        for f in getattr(self.state, "checker_findings", None) or []:
+            try:
+                sev = min(0.95, max(0.1, float(f.get("severity", 0.5))))
+            except (TypeError, ValueError):
+                sev = 0.5
+            out.append(
+                {
+                    "title": str(f.get("title", "Finding"))[:160],
+                    "message": str(f.get("message", ""))[:2500],
+                    "paragraph_anchor": str(f.get("quote", ""))[:400],
+                    "quote": str(f.get("quote", ""))[:240],
+                    "score": sev,
+                    "category": str(f.get("category", "consistency")),
+                    "provenance": f.get("provenance", "deterministic"),
+                }
+            )
+        return out
+
     async def _meta(self, pool, doc, triage, validated, bib, pack) -> dict:
         bib_summary = {
             "entries": bib.get("entries", []),
             "in_text_issues": bib.get("in_text_issues", []),
         }
+        merged = list(validated) + self._checker_comments()
         user = (
             prompts.META_USER.format(
                 title=doc.title,
                 triage_json=json.dumps(triage)[:4000],
-                comments_json=json.dumps(validated, indent=1)[:60_000],
+                comments_json=json.dumps(merged, indent=1)[:100_000],
                 bib_summary=json.dumps(bib_summary)[:8000],
                 sota_notes=(pack.field_hint or "")[:1500],
             )
             + self._venue_block
         )
-        return await pool.complete_json(
+        draft = await pool.complete_json(
             ModelRole.STRONG, prompts.META_SYSTEM, user, call_type="meta"
         )
+        # synthesis: the lead-referee essay over the deduplicated comments,
+        # replacing the merger's overall feedback with argued prose
+        if getattr(self.plan_knobs(), "synthesis", True) and self.budget_allows("synthesis"):
+            essay = await self._synthesis(pool, doc, triage, draft, bib, pack)
+            if essay:
+                draft["overall_feedback"] = essay
+        return draft
+
+    async def _synthesis(self, pool, doc, triage, draft, bib, pack) -> str | None:
+        comments = [c for c in draft.get("comments", []) if isinstance(c, dict)]
+        listing = "\n".join(
+            f"- [{float(c.get('score', 0) or 0):.2f}] "
+            f"({c.get('provenance', 'llm')}) {str(c.get('title', ''))[:110]} "
+            f":: {str(c.get('paragraph_anchor', ''))[:80]}"
+            for c in comments[:120]
+        )
+        bib_summary = json.dumps(
+            {
+                "entries": [
+                    {"raw": e.get("raw_entry", ""), "status": e.get("status", "")}
+                    for e in bib.get("entries", [])
+                    if isinstance(e, dict)
+                ][:40],
+                "in_text_issues": bib.get("in_text_issues", [])[:20],
+            }
+        )[:8000]
+        from open_referee.pipeline.budget import call_max_tokens
+
+        try:
+            res = await pool.complete_json(
+                ModelRole.STRONG,
+                prompts.SYNTHESIS_SYSTEM,
+                prompts.SYNTHESIS_USER.format(
+                    title=doc.title,
+                    triage_json=json.dumps(triage)[:3000],
+                    comments_listing=listing or "(no validated comments)",
+                    bib_summary=bib_summary,
+                    sota_notes=(pack.field_hint or "")[:1500],
+                    venue_block=self._venue_block,
+                ),
+                call_type="synthesis",
+                max_tokens=call_max_tokens(
+                    "synthesis", str(getattr(self.plan_knobs(), "output_budget", "default"))
+                ),
+            )
+        except LLMError as e:
+            logger.warning("synthesis pass failed: %s", e)
+            return None
+        essay = str(res.get("overall_feedback", "")).strip()
+        return essay or None
 
     async def _dm_validator_gate(self, pool, doc, comments: list[dict]) -> list[dict]:
         """Batched predicate per comment: is it grounded in the manuscript?
-        Ungrounded comments are dropped before the (strong) validator pass."""
+        Ungrounded comments are dropped before the (strong) validator pass.
+        Batches of 60 questions per decision call, over ALL comments."""
         if getattr(pool, "decider", None) is None or not comments:
             return comments
         from open_referee.providers.decisions import PredicateQuestion
 
-        listing = "\n".join(
-            f"{i}. [{c.get('title', '')[:60]}] quote={(c.get('quote') or '')[:100]} "
-            f"anchor={(c.get('paragraph_anchor') or '')[:80]}"
-            for i, c in enumerate(comments[:60], 1)
-        )
-        qs = [
-            PredicateQuestion(
-                name=f"comment_{i}",
-                instructions=(
-                    f"Review comment {i} quotes or paraphrases text that actually appears "
-                    "in the manuscript (not invented)."
-                ),
+        kept: list[dict] = []
+        dropped = 0
+        for lo in range(0, len(comments), 60):
+            chunk = comments[lo : lo + 60]
+            listing = "\n".join(
+                f"{i}. [{c.get('title', '')[:60]}] quote={(c.get('quote') or '')[:100]} "
+                f"anchor={(c.get('paragraph_anchor') or '')[:80]}"
+                for i, c in enumerate(chunk, 1)
             )
-            for i in range(1, min(len(comments), 60) + 1)
-        ]
-        try:
-            dm = await pool.decide(
-                f"Manuscript: {doc.title}\n\nComments:\n{listing}", qs, call_type="dm_validate"
-            )
-        except LLMError as e:
-            logger.warning("DM validator gate failed (%s); validator handles all", e)
-            return comments
-        kept = []
-        for i, c in enumerate(comments[:60], 1):
-            a = dm.answer(f"comment_{i}")
-            if a is None or a.probability is None or a.probability >= 0.5:
-                kept.append(c)
-        kept.extend(comments[60:])
-        dropped = len(comments) - len(kept)
+            qs = [
+                PredicateQuestion(
+                    name=f"comment_{i}",
+                    instructions=(
+                        f"Review comment {i} quotes or paraphrases text that actually "
+                        "appears in the manuscript (not invented)."
+                    ),
+                )
+                for i in range(1, len(chunk) + 1)
+            ]
+            try:
+                dm = await pool.decide(
+                    f"Manuscript: {doc.title}\n\nComments:\n{listing}", qs,
+                    call_type="dm_validate",
+                )
+            except LLMError as e:
+                logger.warning("DM validator gate failed (%s); keeping chunk", e)
+                kept.extend(chunk)
+                continue
+            for i, c in enumerate(chunk, 1):
+                a = dm.answer(f"comment_{i}")
+                if a is None or a.probability is None or a.probability >= 0.5:
+                    kept.append(c)
+                else:
+                    dropped += 1
         if dropped:
             await self._emit(
                 Stage.VALIDATE,

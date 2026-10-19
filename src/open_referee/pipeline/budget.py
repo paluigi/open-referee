@@ -129,6 +129,8 @@ class PlanKnobs(BaseModel):
     verify_passes: int = 1  # independent verification passes per claim
     claim_routing: str = "base"  # base | strong (numerical->strong) | all_strong
     output_budget: str = "default"  # low | default | high per-call-type budgets
+    synthesis: bool = True  # lead-referee essay pass over deduplicated comments
+    defense_second_round: bool = False  # second defense pass on upheld comments
 
     @classmethod
     def from_preset(cls, preset) -> PlanKnobs:
@@ -142,6 +144,8 @@ class PlanKnobs(BaseModel):
             verify_passes=getattr(preset, "verify_passes", 1),
             claim_routing=getattr(preset, "claim_routing", "base"),
             output_budget=getattr(preset, "output_budget", "default"),
+            synthesis=getattr(preset, "synthesis", True),
+            defense_second_round=getattr(preset, "defense_second_round", False),
         )
 
 
@@ -156,6 +160,7 @@ OUTPUT_BUDGETS: dict[str, dict[str, int]] = {
         "whole_paper_verify": 8192,
         "whole_paper_challenge": 8192,
         "meta": 4096,
+        "synthesis": 4096,
         "validate": 4096,
     },
     "default": {
@@ -166,6 +171,7 @@ OUTPUT_BUDGETS: dict[str, dict[str, int]] = {
         "whole_paper_challenge": 12288,
         "section_challenger": 4096,
         "meta": 6144,
+        "synthesis": 6144,
         "validate": 6144,
     },
     "high": {
@@ -176,6 +182,7 @@ OUTPUT_BUDGETS: dict[str, dict[str, int]] = {
         "whole_paper_challenge": 16384,
         "section_challenger": 6144,
         "meta": 8192,
+        "synthesis": 8192,
         "validate": 8192,
     },
 }
@@ -383,6 +390,8 @@ class BudgetHarness:
                 return ("strong", 3500, 1200)
             case "claim_arbitrate":
                 return ("strong", 8000, 1500)
+            case "synthesis":
+                return ("strong", 18_000, 6000)
             case "dm_call":
                 return ("decision", 5000, 1)
         return ("small", 4000, 1500)
@@ -405,7 +414,7 @@ class BudgetHarness:
 
     def _est_comments(self, knobs: PlanKnobs) -> int:
         n_claims_checked = min(knobs.max_claims, self.stats.known_or_estimated_claims)
-        return min(120, math.ceil(n_claims_checked * 0.5) + self.stats.n_sections * 2)
+        return min(200, math.ceil(n_claims_checked * 0.5) + self.stats.n_sections * 2)
 
     def _call_counts(self, knobs: PlanKnobs) -> dict[str, int]:
         claims = min(knobs.max_claims, self.stats.known_or_estimated_claims)
@@ -432,12 +441,17 @@ class BudgetHarness:
             "whole_paper_verify": 1 if knobs.whole_paper_passes else 0,
             "section_challenger": self.stats.n_sections,
             "whole_paper_challenge": 1,
-            "defense": self._est_comments(knobs) if knobs.defense_round else 0,
+            "defense": (
+                (self._est_comments(knobs) * (2 if knobs.defense_second_round else 1))
+                if knobs.defense_round
+                else 0
+            ),
             "adjudication": self._est_comments(knobs) if knobs.defense_round else 0,
             "bibliography": 1 if self.stats.n_references else 0,
             "recompute_extract": 1 if knobs.recompute else 0,
             "recompute_verify": 3 if knobs.recompute else 0,
             "meta": 1,
+            "synthesis": 1 if knobs.synthesis else 0,
             "validate": 1,
         }
         return {ct: n for ct, n in counts.items() if n > 0}
@@ -471,6 +485,7 @@ class BudgetHarness:
             defense_round=False,
             max_artifacts=0,
             recompute=False,
+            synthesis=False,  # starved runs keep the meta merger's own overall
         )
 
     def _cost_of(self, knobs: PlanKnobs) -> float:
