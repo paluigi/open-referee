@@ -34,7 +34,12 @@ def test_depth_presets():
     assert not fast.per_section_lenses and not fast.defense_round
     assert fast.max_claims == 20
     assert std.per_section_lenses and std.defense_round and std.max_claims == 60
-    assert deep.max_claims == 150 and deep.max_artifacts == 25
+    assert std.verify_passes == 2 and std.claim_routing == "strong"
+    assert std.recompute and std.synthesis and not std.defense_second_round
+    assert deep.max_claims == 150 and deep.max_artifacts == 50
+    assert deep.verify_passes == 3 and deep.claim_routing == "all_strong"
+    assert deep.defense_second_round and deep.output_budget == "high"
+    assert fast.verify_passes == 1 and not fast.recompute and fast.output_budget == "low"
     with pytest.raises(ValueError):
         ReviewConfig(depth="ultra").depth_preset()
 
@@ -168,22 +173,25 @@ async def test_verify_claims_dispatch(test_config, sample_doc):
             "section": "3. Main result",
         },
     ]
-    strong.queue(
-        json.dumps(
-            {
-                "comments": [
-                    {
-                        "title": "Proof gap",
-                        "quote": "stable",
-                        "message": "no proof",
-                        "score": 0.8,
-                        "category": "math",
-                    }
-                ]
-            }
+    # standard preset verifies twice: the finding reproduces -> confirmed
+    for _ in range(2):
+        strong.queue(
+            json.dumps(
+                {
+                    "comments": [
+                        {
+                            "title": "Proof gap",
+                            "quote": "stable",
+                            "message": "no proof",
+                            "score": 0.8,
+                            "category": "math",
+                        }
+                    ]
+                }
+            )
         )
-    )
     small.queue(json.dumps({"comments": []}))
+    small.queue(json.dumps({"comments": []}))  # pass 2 for the small-model claim
 
     emitted = []
 
@@ -195,9 +203,10 @@ async def test_verify_claims_dispatch(test_config, sample_doc):
     comments = await verify_claims(pipeline, pool, sample_doc, claims, test_config)
     assert len(comments) == 1
     assert comments[0]["claim_id"] == "cl01"
+    assert comments[0]["provenance"] == "claim_verify 2-of-2"
     # anchor inherited from claim
     assert "Theorem 1" in comments[0]["paragraph_anchor"]
-    assert len(strong.calls) == 1 and len(small.calls) == 1  # role dispatch correct
+    assert len(strong.calls) == 2 and len(small.calls) == 2  # 2 passes per claim
     await pool.close()
 
 

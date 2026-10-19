@@ -220,3 +220,33 @@ def test_openai_payload_includes_reasoning_effort():
     asyncio.new_event_loop().run_until_complete(run())
     assert captured.get("reasoning_effort") == "high"
     assert captured.get("max_tokens") == 4096
+
+
+# ------------------------------------------------------------- presets/frontier --
+
+
+def test_preset_depth_axes():
+    from open_referee.pipeline.budget import PRESET_KNOBS
+
+    fast, std, deep = PRESET_KNOBS["fast"], PRESET_KNOBS["standard"], PRESET_KNOBS["deep"]
+    assert fast.verify_passes == 1 and not fast.recompute and fast.output_budget == "low"
+    assert std.verify_passes == 2 and std.claim_routing == "strong" and std.recompute
+    assert deep.verify_passes == 3 and deep.claim_routing == "all_strong"
+    assert deep.defense_second_round and deep.max_artifacts == 50
+    # strict ordering of expected cost ingredients
+    assert fast.verify_passes < std.verify_passes < deep.verify_passes
+
+
+def test_frontier_includes_depth_archetypes():
+    import sys
+
+    sys.path.insert(0, "tests")
+    from open_referee.pipeline.budget import DocumentStats
+    from test_budget import make_harness
+
+    stats = DocumentStats(chars=120_000, n_sections=8, n_claims=40, n_references=20)
+    h, _ = make_harness(budget=500.0, stats=stats)
+    names = [p.name for p in h.frontier(limit=20)]
+    assert "cross-check" in names and "rigor-max" in names
+    cross = next(p for p in h.frontier(limit=20) if p.name == "cross-check")
+    assert cross.knobs.verify_passes == 2 and cross.knobs.claim_routing == "strong"

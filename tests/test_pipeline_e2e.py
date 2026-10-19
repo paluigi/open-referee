@@ -127,7 +127,9 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
     small.queue(
         json.dumps({"selected": [], "state_of_the_art_notes": "n/a", "missing_references": []})
     )
-    # per-claim worker (small for cross_reference would be small; theorem_proof -> strong)
+    # per-claim worker: standard preset verifies twice; identical scripted
+    # findings reproduce -> confirmed 2-of-2 without arbitration
+    strong.queue(_script_comments("claim"))
     strong.queue(_script_comments("claim"))
     for _ in range(n_verify):
         small.queue(_script_comments("lens"))

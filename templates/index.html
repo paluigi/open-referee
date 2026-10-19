@@ -32,13 +32,27 @@
           <select name="depth" id="depth-select">
             <option value="default">Use settings default ({{ cfg.review.depth }})</option>
             <option value="auto">Auto — budget-driven (est. floor: <span id="est-fast">…</span>)</option>
-            <option value="fast">fast (est. <span data-est="fast">…</span>)</option>
-            <option value="standard">standard (est. <span data-est="standard">…</span>)</option>
-            <option value="deep">deep (est. <span data-est="deep">…</span>)</option>
+            <option value="fast">fast — cheap pass, less detailed (est. <span data-est="fast">…</span>)</option>
+            <option value="standard">standard — full-depth review (est. <span data-est="standard">…</span>)</option>
+            <option value="deep">deep — max rigor: triple-pass, cross-model audit (est. <span data-est="deep">…</span>)</option>
           </select>
         </label>
         <p class="muted small" id="estimate-note">Select a manuscript to get mechanical cost
           estimates for the presets (no model is called).</p>
+        <details class="muted small">
+          <summary>What each depth does</summary>
+          <p><strong>fast</strong>: single-pass claim verification, deterministic checkers
+            (cross-references, number consistency, table arithmetic, DOI resolution),
+            whole-paper pass, concise synthesis.</p>
+          <p><strong>standard</strong>: everything in fast, plus two independent
+            verification passes per claim (findings must reproduce), strong-model routing
+            on numerical/table claims, full section×lens grid, defense gate, formula
+            recomputation, and the lead-referee synthesis essay.</p>
+          <p><strong>deep</strong>: three verification passes per claim with cross-model
+            auditing (configure an <code>auditor</code> role for true model independence),
+            all claims on the strong model, double defense rounds, maximum reasoning
+            budgets, up to 50 artifacts.</p>
+        </details>
         <label>Budget for this run (USD, optional — cap in every mode, drives the planner in auto)
           <input type="number" name="budget" step="0.5" min="0" placeholder="{{ '%g'|format(cfg.review.max_cost_usd) }}">
         </label>

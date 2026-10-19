@@ -1178,20 +1178,36 @@ class BudgetHarness:
 DEPTH_LEVELS = (0, 10, 25, 50, 150)  # claim counts by importance rank (capped)
 
 PRESET_KNOBS: dict[str, PlanKnobs] = {
+    # cheaper and less detailed than hosted deep-review products
     "fast": PlanKnobs(
         max_claims=20,
         per_section_lenses=False,
         whole_paper_passes=True,
         defense_round=False,
         max_artifacts=6,
+        recompute=False,
+        verify_passes=1,
+        claim_routing="base",
+        output_budget="low",
     ),
-    "standard": PlanKnobs(),
+    # "match Refine": reproduction voting on every claim, strong-model routing
+    # on numerical/table claims, full lens grid, defense, all checkers + DOI
+    # loop, lead-referee synthesis
+    "standard": PlanKnobs(
+        verify_passes=2,
+        claim_routing="strong",
+        output_budget="default",
+    ),
+    # "deeper than Refine": triple-pass verification routed to the auditor
+    # when configured, all claims on the strong model, double defense, max
+    # reasoning budgets
     "deep": PlanKnobs(
         max_claims=150,
-        per_section_lenses=True,
-        whole_paper_passes=True,
-        defense_round=True,
-        max_artifacts=25,
+        max_artifacts=50,
+        verify_passes=3,
+        claim_routing="all_strong",
+        output_budget="high",
+        defense_second_round=True,
     ),
 }
 
@@ -1306,6 +1322,45 @@ FRONTIER_ARCHETYPES: list[tuple[str, str, PlanKnobs]] = [
             whole_paper_passes=True,
             defense_round=True,
             max_artifacts=12,
+        ),
+    ),
+    (
+        "cross-check",
+        "Top-20 claims, each verified twice (auditor if configured), strong "
+        "numerical routing + defense",
+        PlanKnobs(
+            max_claims=20,
+            per_section_lenses=False,
+            whole_paper_passes=True,
+            defense_round=True,
+            verify_passes=2,
+            claim_routing="strong",
+        ),
+    ),
+    (
+        "deep-verify",
+        "Top-30 claims, triple-pass verification (auditor cross-examination), "
+        "all-strong routing, defense + recomputation",
+        PlanKnobs(
+            max_claims=30,
+            per_section_lenses=False,
+            whole_paper_passes=True,
+            defense_round=True,
+            verify_passes=3,
+            claim_routing="all_strong",
+        ),
+    ),
+    (
+        "rigor-max",
+        "Top-40 claims × 2 passes + full breadth + defense + recomputation",
+        PlanKnobs(
+            max_claims=40,
+            per_section_lenses=True,
+            whole_paper_passes=True,
+            defense_round=True,
+            max_artifacts=6,
+            verify_passes=2,
+            claim_routing="strong",
         ),
     ),
     (
