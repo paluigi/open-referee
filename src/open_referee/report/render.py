@@ -77,23 +77,66 @@ def _attribution_lines() -> list[str]:
     ]
 
 
+_DETERMINISTIC_PROVENANCE = ("deterministic", "recompute")
+
+
+def _comment_header(i: int, c) -> str:
+    badges = [f"severity {c.score:.2f}", str(c.category or "general")]
+    if c.provenance:
+        badges.append(c.provenance)
+    tag = " · ".join(f"[{b}]" for b in badges)
+    sec = f" — _{c.section}_" if c.section else ""
+    return f"### {i}. {c.title} {sec}", tag
+
+
 def render_markdown(report: ReviewReport) -> str:
     parts = [f"# Review report — {report.paper_title}", ""]
-    parts.append(f"_Generated {report.generated_at:%Y-%m-%d %H:%M UTC} · run `{report.run_id}`_")
+    parts.append(f"_Generated {report.generated_at:%Y-%m-%d %H:%M} UTC · run `{report.run_id}`_")
     if report.model_roles:
         roles = ", ".join(f"{role}: `{spec}`" for role, spec in sorted(report.model_roles.items()))
         parts.append(f"_Models — {roles}_")
     parts += ["", "## Paper summary", "", report.paper_summary or "_(none)_", ""]
     parts += ["## Overall feedback", "", report.overall_feedback or "_(none)_", ""]
 
-    parts += [f"## Detailed comments ({len(report.comments)})", ""]
-    for i, c in enumerate(report.sorted_comments(), 1):
-        sev = f"[severity {c.score:.2f}]"
-        sec = f" — _{c.section}_" if c.section else ""
-        parts.append(f"### {i}. {c.title} {sev}{sec}")
+    # findings by relevance (severity), deterministic ones in their own section
+    llm_comments = [
+        c for c in report.sorted_comments()
+        if (c.provenance or "") not in _DETERMINISTIC_PROVENANCE
+    ]
+    det_comments = [
+        c for c in report.sorted_comments()
+        if (c.provenance or "") in _DETERMINISTIC_PROVENANCE
+    ]
+    parts += [f"## Findings ({len(llm_comments)})", ""]
+    parts.append(
+        "_Sorted by relevance (severity). Provenance tags show how each finding "
+        "was verified: `claim_verify 2-of-2` means it reproduced in two "
+        "independent passes; `arbitrated` findings passed a strong-model gate; "
+        "`auditor` entries were produced or cross-checked by a second model._"
+    )
+    parts.append("")
+    for i, c in enumerate(llm_comments, 1):
+        header, tag = _comment_header(i, c)
+        parts.append(header)
+        parts.append(f"_{tag}_")
         if c.quote:
             parts += ["", f"> {c.quote}"]
         parts += ["", c.message, ""]
+    if det_comments:
+        parts += [f"## Deterministic checks ({len(det_comments)})", ""]
+        parts.append(
+            "_Produced by code, not language models: cross-reference resolution, "
+            "number consistency, table arithmetic, formula recomputation "
+            "(sympy), and reference resolution against Crossref/OpenAlex._"
+        )
+        parts.append("")
+        for i, c in enumerate(det_comments, 1):
+            header, tag = _comment_header(i, c)
+            parts.append(header)
+            parts.append(f"_{tag}_")
+            if c.quote:
+                parts += ["", f"> {c.quote}"]
+            parts += ["", c.message, ""]
     if report.validator_notes:
         parts += ["## Validator notes", "", report.validator_notes, ""]
     if report.plan_summary:

@@ -155,3 +155,34 @@ def test_reportlab_fallback_link_conversion():
         )
         == "Built with open-referee (https://github.com/paluigi/open-referee)"
     )
+
+
+def test_markdown_separates_deterministic_findings_and_shows_provenance():
+    report = _review_report()
+    report.comments = [
+        ReviewComment(
+            id="c001",
+            title="Conflicting MAE values",
+            message="0.313 vs 0.418.",
+            score=0.7,
+            provenance="deterministic",
+            category="consistency",
+        ),
+        ReviewComment(
+            id="c002",
+            title="Proof gap",
+            message="No proof given.",
+            score=0.8,
+            provenance="claim_verify 2-of-2",
+            category="math",
+        ),
+    ]
+    md = render_markdown(report)
+    assert "## Findings (1)" in md
+    assert "## Deterministic checks (1)" in md
+    assert "[claim_verify 2-of-2]" in md
+    assert "[deterministic]" in md
+    # deterministic explanation names the check families
+    assert "formula recomputation" in md
+    # ordering: LLM finding section appears before deterministic section
+    assert md.index("## Findings") < md.index("## Deterministic checks")

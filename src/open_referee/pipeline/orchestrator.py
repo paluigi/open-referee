@@ -1467,6 +1467,7 @@ class ReviewPipeline:
                     score=score,
                     category=c.get("category") or "general",
                     anchor_confidence=confidence,
+                    provenance=(c.get("provenance") or None) if isinstance(c, dict) else None,
                 )
             )
         u = self._pool.ledger if self._pool else None

@@ -28,6 +28,9 @@ class ReviewComment(BaseModel):
     score: float = Field(ge=0.0, le=1.0)  # severity
     category: str = "general"  # math | consistency | evidence | references | clarity | novelty ...
     anchor_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    # how the finding was produced: deterministic | recompute | claim_verify 2-of-2 |
+    # claim_verify 1-of-2 + arbitrated | lens | challenger ...
+    provenance: str | None = None
 
 
 class UsageSummary(BaseModel):
