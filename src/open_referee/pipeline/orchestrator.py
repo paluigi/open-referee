@@ -922,13 +922,19 @@ class ReviewPipeline:
             await router.close()
 
     def _reviewable_sections(self, doc: Document) -> list[tuple[str, str]]:
-        """(title, text) for chunks worth verifying; falls back to one big chunk."""
+        """(title, text) for chunks worth verifying. Falls back to a
+        heading-heuristic split when parsing produced no sections or a single
+        degenerate one covering the whole document (plain-text conversions)."""
         out: list[tuple[str, str]] = []
         if doc.sections:
             for s in doc.sections:
                 text = "\n\n".join(b.text for b in doc.blocks[s.start_block : s.end_block])
                 if len(text) > 400:
                     out.append((s.title, text))
+        if len(out) <= 1:
+            split = _split_by_headings(doc.full_text())
+            if len(split) > len(out):
+                out = split
         if not out:
             out.append(("Full manuscript", doc.full_text()))
         return out
@@ -1435,6 +1441,68 @@ def _section_of_block(doc: Document, block_id: str | None) -> str | None:
         if b.id == block_id:
             return b.section_path[0] if b.section_path else None
     return None
+
+
+_FALLBACK_MD_RE = re.compile(r"^#{1,3}\s+(\S.*)$")  # markdown
+_FALLBACK_NUM_RE = re.compile(
+    r"^(?:\d{1,2}(?:\.\d+)*\.?|Appendix\s+[A-Z])\s+[A-Z].{2,120}$"
+)  # numbered section lines
+_FALLBACK_KW_RE = re.compile(r"^(?:abstract|references|bibliography|appendix|conclusions?)\s*$", re.I)
+_FALLBACK_CAPS_RE = re.compile(r"^[A-Z][A-Z0-9 :&\-]{3,60}$")
+_FALLBACK_MIN_CHARS = 400
+_FALLBACK_MAX_SECTIONS = 20
+
+
+def _split_by_headings(text: str) -> list[tuple[str, str]]:
+    """Split full text into (title, chunk) pairs when no sections were parsed.
+
+    Detects markdown headings, numbered section lines ('2.3 Methods'), keyword
+    headings (Abstract/References/...) and short ALL-CAPS title lines; skips
+    author-list style caps lines (commas, long). Chunks below the minimum
+    length merge into the previous section."""
+    lines = text.split("\n")
+    boundaries: list[tuple[int, str]] = []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if len(s) < 3 or len(s) > 130:
+            continue
+        if m := _FALLBACK_MD_RE.match(s):
+            boundaries.append((i, m.group(1).strip()))
+            continue
+        if _FALLBACK_NUM_RE.match(s):
+            boundaries.append((i, s))
+            continue
+        if _FALLBACK_KW_RE.match(s):
+            boundaries.append((i, s.title()))
+            continue
+        if _FALLBACK_CAPS_RE.match(s) and "," not in s and len(s.split()) <= 8:
+            boundaries.append((i, s))
+    if not boundaries:
+        return []
+
+    sections: list[list[str]] = []
+    titles: list[str] = []
+    if boundaries[0][0] > 0:
+        sections.append(lines[: boundaries[0][0]])
+        titles.append("Front matter")
+    for bi, (start, title) in enumerate(boundaries):
+        end = boundaries[bi + 1][0] if bi + 1 < len(boundaries) else len(lines)
+        sections.append(lines[start:end])
+        titles.append(title)
+
+    out: list[tuple[str, str]] = []
+    for title, chunk_lines in zip(titles, sections):
+        chunk = "\n".join(chunk_lines).strip()
+        if not chunk:
+            continue
+        if len(chunk) < _FALLBACK_MIN_CHARS and out:
+            out[-1] = (out[-1][0], out[-1][1] + "\n\n" + chunk)
+        else:
+            out.append((title, chunk))
+    while len(out) > _FALLBACK_MAX_SECTIONS:
+        last = out.pop()
+        out[-1] = (out[-1][0], out[-1][1] + "\n\n" + last[1])
+    return out
 
 
 def _hit_to_item(hit, why: str):
