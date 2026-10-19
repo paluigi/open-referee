@@ -35,12 +35,16 @@ async def run_recompute(pipeline, pool: RolePool, doc: Document, cfg: Config) ->
         return []
     if not pipeline.budget_allows("recompute_extract"):
         return []
+    from open_referee.pipeline.budget import call_max_tokens
+
+    out_level = str(getattr(pipeline.plan_knobs(), "output_budget", "default"))
     try:
         res = await pool.complete_json(
             ModelRole.SMALL,
             prompts_checkers.RECOMPUTE_EXTRACT_SYSTEM,
             prompts_checkers.RECOMPUTE_EXTRACT_USER.format(title=doc.title, excerpt=excerpt),
             call_type="recompute_extract",
+            max_tokens=call_max_tokens("recompute_extract", out_level),
         )
     except Exception as e:
         logger.warning("recompute extraction failed: %s", e)
@@ -98,6 +102,9 @@ async def _verify_mismatch(
 ) -> CheckFinding | None:
     if not pipeline.budget_allows("recompute_verify"):
         return None
+    from open_referee.pipeline.budget import call_max_tokens
+
+    out_level = str(getattr(pipeline.plan_knobs(), "output_budget", "default"))
     try:
         verdict = await pool.complete_json(
             ModelRole.STRONG,
@@ -112,6 +119,7 @@ async def _verify_mismatch(
                 section=str(q.get("section", ""))[:120],
             ),
             call_type="recompute_verify",
+            max_tokens=call_max_tokens("recompute_verify", out_level),
         )
     except Exception as e:
         logger.warning("recompute verification failed: %s", e)

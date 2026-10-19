@@ -158,7 +158,7 @@ class _FakePool:
         self.verify = verify
         self.calls: list[str] = []
 
-    async def complete_json(self, role, system, user, call_type="other"):
+    async def complete_json(self, role, system, user, call_type="other", **kw):
         self.calls.append(call_type)
         if call_type == "recompute_extract":
             return self.extract
