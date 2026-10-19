@@ -99,13 +99,25 @@ class LLMConfig(BaseModel):
 class OpenAlexConfig(BaseModel):
     api_key_env: str = "OPENALEX_API_KEY"
     email: str | None = None
+    email_env: str = "OPENALEX_EMAIL"
 
     def resolved_api_key(self) -> str | None:
         return os.environ.get(self.api_key_env)
 
+    def resolved_email(self) -> str | None:
+        if self.email is not None:
+            return self.email
+        return os.environ.get(self.email_env) or os.environ.get("EMAIL")
+
 
 class CrossrefConfig(BaseModel):
     email: str | None = None
+    email_env: str = "CROSSREF_EMAIL"
+
+    def resolved_email(self) -> str | None:
+        if self.email is not None:
+            return self.email
+        return os.environ.get(self.email_env) or os.environ.get("EMAIL")
 
 
 class SearchEngineConfig(BaseModel):
@@ -271,8 +283,12 @@ def example_config_text() -> str:
                     },
                 },
             },
-            "openalex": {"api_key_env": "OPENALEX_API_KEY", "email": "you@institution.edu"},
-            "crossref": {"email": "you@institution.edu"},
+            "openalex": {
+                "api_key_env": "OPENALEX_API_KEY",
+                "email": "you@institution.edu",
+                "email_env": "OPENALEX_EMAIL",
+            },
+            "crossref": {"email": "you@institution.edu", "email_env": "CROSSREF_EMAIL"},
             "search": {
                 "order": ["tavily", "tinyfish", "brave"],
                 "tavily": {"api_key_env": "TAVILY_API_KEY", "enabled": True},

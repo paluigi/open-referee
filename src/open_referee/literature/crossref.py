@@ -13,8 +13,8 @@ URL = "https://api.crossref.org/works"
 class CrossrefClient:
     def __init__(self, cfg: CrossrefConfig):
         headers = {}
-        if cfg.email:
-            headers["User-Agent"] = f"open-referee/0.1 (mailto:{cfg.email})"
+        if cfg.resolved_email():
+            headers["User-Agent"] = f"open-referee/0.1 (mailto:{cfg.resolved_email()})"
         self._http = httpx.AsyncClient(base_url=URL, timeout=30.0, headers=headers)
 
     async def __aenter__(self) -> CrossrefClient:
