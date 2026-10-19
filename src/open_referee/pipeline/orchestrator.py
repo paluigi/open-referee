@@ -133,8 +133,18 @@ class RolePool:
     ) -> dict:
         """JSON-mode completion with parse-repair retry, ledger check, usage record.
 
-        ``max_tokens`` overrides the role's output budget for this call only
-        (per-call-type budgets from the plan's output_budget level)."""
+        ``max_tokens`` overrides the role's output budget for this call only;
+        when omitted, the per-call-type budget from the plan's output_budget
+        level applies automatically (falling back to the role default for
+        unlisted call types)."""
+        from open_referee.pipeline.budget import call_max_tokens
+
+        if max_tokens is None:
+            level = "default"
+            h = getattr(self, "harness", None)
+            if h is not None and h.plan is not None:
+                level = str(getattr(h.plan.knobs, "output_budget", "default"))
+            max_tokens = call_max_tokens(call_type, level)
         provider = self.providers[role]
         spec = self.specs[role]
         override = max_tokens is not None and max_tokens != spec.max_tokens
