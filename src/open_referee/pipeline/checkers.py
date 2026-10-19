@@ -99,7 +99,7 @@ def cross_reference_check(doc: Document) -> list[CheckFinding]:
             if b.type.value == "paragraph" and len(s) >= 120:
                 continue  # long body paragraphs are prose, not labels
             m = _LABEL_DEF_RE.match(s)
-            if m:
+            if m and _looks_like_definition(s, m.end()):
                 define(_CLASS_CANON[m.group(1).lower()], m.group(2), b.id)
                 break
             if b.type.value == "equation":
@@ -283,6 +283,20 @@ def cross_reference_check(doc: Document) -> list[CheckFinding]:
                 )
             )
     return findings[:_MAX_XREF_FINDINGS]
+
+
+_DEF_PUNCT = (":", ".", ",", ";", ")", "—", "–", "-")
+
+
+def _looks_like_definition(line: str, match_end: int) -> bool:
+    """A label at line start is a DEFINITION only when caption punctuation
+    follows it ('Figure 1:', 'Theorem 2.', 'Appendix A.'). A letter follows
+    in prose ('Figure 9 plots...', 'Table 1 reports...') — that is a
+    reference, not a definition."""
+    rest = line[match_end:].lstrip()
+    if not rest:
+        return True
+    return rest[0] in _DEF_PUNCT
 
 
 def _quote_block(doc: Document, block_id: str) -> str:
@@ -475,8 +489,11 @@ def _mentions(blocks: list) -> list[dict]:
 
 def _same_quantity(words_a: list[str], words_b: list[str]) -> bool:
     """Two mention prefixes name the same quantity when their last two
-    normalized words agree (window shifts of 3+ words don't collide)."""
-    return len(words_a) >= 2 and len(words_b) >= 2 and words_a[-2:] == words_b[-2:]
+    content words (connectors ignored) agree — "mean absolute error of" and
+    "pooled mean absolute error is" both reduce to (absolute, error)."""
+    ca = [w for w in words_a if w not in _CONNECTORS]
+    cb = [w for w in words_b if w not in _CONNECTORS]
+    return len(ca) >= 2 and len(cb) >= 2 and ca[-2:] == cb[-2:]
 
 
 # ------------------------------------------------------- table arithmetic --
