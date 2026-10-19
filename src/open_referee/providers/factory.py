@@ -24,6 +24,7 @@ def build_provider(llm_cfg: LLMConfig, role_cfg: RoleConfig) -> ChatProvider:
         max_tokens=role_cfg.max_tokens,
         timeout_s=llm_cfg.request_timeout_s,
         max_retries=llm_cfg.max_retries,
+        reasoning_effort=role_cfg.reasoning_effort,
     )
     return _from_spec(spec)
 

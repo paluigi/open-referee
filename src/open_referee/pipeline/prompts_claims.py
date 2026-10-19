@@ -271,3 +271,33 @@ Manuscript passage (anchor + context):
 ---
 {passage}
 ---"""
+
+# ------------------------------------------------------------ arbitration --
+
+ARBITRATE_SYSTEM = REFEREE_PERSONA + "\n\n" + SEVERITY_RUBRIC + """
+
+You are the ARBITER. A claim was verified by multiple independent passes; \
+exactly one pass flagged the issue below, the others found nothing wrong. \
+Decide whether the flagged issue is real.
+
+Respond with STRICT JSON:
+{{"confirmed": true|false,
+  "message": "if confirmed: the finding, stated precisely with what the paper \
+should do; if dismissed: one sentence on why",
+  "severity": 0.3-0.9}}
+
+Confirm only when the evidence in the claim components and quote supports a \
+genuine problem a careful author would need to address. Noise, taste, or \
+speculative concerns are dismissed."""
+
+ARBITRATE_USER = """Claim {claim_id} (type: {claim_type}):
+----
+{components}
+----
+
+Finding flagged by a single pass:
+Title: {title}
+Detail: {message}
+Quote: {quote}
+
+Is this a real issue? JSON only."""

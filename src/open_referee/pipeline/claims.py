@@ -40,9 +40,11 @@ CLAIM_TYPE_ROLES = {
 
 
 async def run_claim_inventory(
-    pool: RolePool, doc: Document, triage: dict, cfg: Config
+    pool: RolePool, doc: Document, triage: dict, cfg: Config, output_budget: str = "default"
 ) -> list[dict]:
     """CLAIMS stage: exhaustive atomic claim catalogue for the manuscript."""
+    from open_referee.pipeline.budget import call_max_tokens
+
     user = prompts_claims.CLAIM_INVENTORY_USER.format(
         title=doc.title,
         triage_json=json.dumps(triage)[:3000],
@@ -54,6 +56,7 @@ async def run_claim_inventory(
             prompts_claims.CLAIM_INVENTORY_SYSTEM,
             user,
             call_type="claim_inventory",
+            max_tokens=call_max_tokens("claim_inventory", output_budget),
         )
     except Exception as e:
         logger.warning("claim inventory failed: %s", e)
@@ -73,6 +76,65 @@ async def run_claim_inventory(
     return out
 
 
+def claim_role(ctype: str, routing: str) -> ModelRole:
+    """Role for a claim type under the plan's routing level.
+
+    base: today's split (strong re-derives math, small does mechanical checks).
+    strong: numerical/table claims also go to strong (recomputation covers the
+    mechanical part). all_strong: every claim on the strong model."""
+    base = CLAIM_TYPE_ROLES.get(ctype, ModelRole.SMALL)
+    if routing == "all_strong":
+        return ModelRole.STRONG
+    if routing == "strong" and ctype in ("numerical", "table_text"):
+        return ModelRole.STRONG
+    return base
+
+
+def _similar_comments(a: dict, b: dict) -> bool:
+    """Two comments flag the same issue (title+message overlap)."""
+    import difflib
+
+    ta = _norm(str(a.get("title", "")) + " " + str(a.get("message", "")))
+    tb = _norm(str(b.get("title", "")) + " " + str(b.get("message", "")))
+    if not ta or not tb:
+        return False
+    return difflib.SequenceMatcher(None, ta, tb).ratio() >= 0.6
+
+
+async def _arbitrate(pipeline, pool, claim: dict, candidate: dict) -> dict | None:
+    """Strong-model gate for a finding that only one verification pass found."""
+    if not pipeline.budget_allows("claim_arbitrate"):
+        return None
+    try:
+        verdict = await pool.complete_json(
+            ModelRole.STRONG,
+            prompts_claims.ARBITRATE_SYSTEM,
+            prompts_claims.ARBITRATE_USER.format(
+                claim_id=claim.get("id"),
+                claim_type=claim.get("type"),
+                components=json.dumps(claim.get("components", {}))[:6000],
+                title=str(candidate.get("title", ""))[:200],
+                message=str(candidate.get("message", ""))[:1200],
+                quote=str(candidate.get("quote", ""))[:400],
+            ),
+            call_type="claim_arbitrate",
+        )
+    except Exception as e:
+        logger.warning("arbitration for claim %s failed: %s", claim.get("id"), e)
+        return None
+    if not verdict.get("confirmed"):
+        return None
+    out = dict(candidate)
+    if verdict.get("message"):
+        out["message"] = str(verdict["message"])[:2000]
+    if verdict.get("severity") is not None:
+        try:
+            out["score"] = float(verdict["severity"])
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 async def verify_claims(
     pipeline, pool: RolePool, doc: Document, claims: list[dict], cfg: Config
 ) -> list[dict]:
@@ -80,8 +142,18 @@ async def verify_claims(
 
     When the committee already importance-ranked the claims (auto mode), the
     given order is authoritative; otherwise the inventory's coarse importance
-    sorts the queue (central first)."""
+    sorts the queue (central first).
+
+    Depth engine: with verify_passes = k each claim is verified k times
+    independently (passes >= 2 route to the auditor model when configured).
+    A finding must reproduce in at least two passes to be confirmed outright;
+    a single-pass finding goes to a strong-model arbitration gate."""
     knobs = pipeline.plan_knobs()
+    passes = max(1, int(getattr(knobs, "verify_passes", 1)))
+    routing = str(getattr(knobs, "claim_routing", "base")).lower()
+    out_budget = str(getattr(knobs, "output_budget", "default"))
+    from open_referee.pipeline.budget import call_max_tokens
+
     if getattr(pipeline, "_claims_ranked", False):
         ordered = list(claims)
     else:
@@ -89,23 +161,29 @@ async def verify_claims(
         ordered = sorted(claims, key=lambda c: order.get(str(c.get("importance")).lower(), 1))
     selected = ordered[: knobs.max_claims]
 
+    auditor_available = ModelRole.AUDITOR in getattr(pool, "providers", {})
     sem = asyncio.Semaphore(cfg.review.max_parallel_calls)
     results: list[dict] = []
     verified = 0
 
-    # definitions packs: built lazily per theorem environment, keyed by anchor
-    async def verify_one(claim: dict):
-        nonlocal verified
-        async with sem:
-            if not pipeline.budget_allows("claim_verify"):
-                return []
-            verified += 1
-            ctype = str(claim.get("type")).lower()
-            role = CLAIM_TYPE_ROLES.get(ctype, ModelRole.SMALL)
-            system = prompts_claims.claim_verify_system(ctype)
-            components = json.dumps(claim.get("components", {}), indent=1)[:12_000]
-            defs = _definitions_for(doc, claim)
-            user = prompts_claims.CLAIM_VERIFY_USER.format(
+    async def run_pass(claim: dict, pass_idx: int) -> list[dict]:
+        ctype = str(claim.get("type")).lower()
+        if pass_idx >= 1 and auditor_available:
+            role = ModelRole.AUDITOR
+        else:
+            role = claim_role(ctype, routing)
+        system = prompts_claims.claim_verify_system(ctype)
+        components = json.dumps(claim.get("components", {}), indent=1)[:12_000]
+        defs = _definitions_for(doc, claim)
+        pass_tag = (
+            f"\n\n[Independent verification pass {pass_idx + 1} of {passes}. "
+            "Re-derive everything from the definitions; do not assume earlier "
+            "passes were correct.]"
+            if passes > 1
+            else ""
+        )
+        user = (
+            prompts_claims.CLAIM_VERIFY_USER.format(
                 claim_id=claim.get("id"),
                 claim_type=ctype,
                 importance=claim.get("importance"),
@@ -113,15 +191,42 @@ async def verify_claims(
                 components=components,
                 definitions=defs[:6000],
             )
-            try:
-                res = await pool.complete_json(role, system, user, call_type="claim_verify")
-            except Exception as e:
-                logger.warning("claim %s (%s) failed: %s", claim.get("id"), ctype, e)
+            + pass_tag
+        )
+        res = await pool.complete_json(
+            role,
+            system,
+            user,
+            call_type="claim_verify",
+            max_tokens=call_max_tokens("claim_verify", out_budget),
+        )
+        comments = [c for c in res.get("comments", []) if isinstance(c, dict)]
+        for c in comments:
+            c.setdefault("paragraph_anchor", claim.get("anchor", ""))
+            c["claim_id"] = claim.get("id")
+        return comments
+
+    async def verify_one(claim: dict):
+        nonlocal verified
+        async with sem:
+            if not pipeline.budget_allows("claim_verify"):
                 return []
-            comments = [c for c in res.get("comments", []) if isinstance(c, dict)]
-            for c in comments:
-                c.setdefault("paragraph_anchor", claim.get("anchor", ""))
-                c["claim_id"] = claim.get("id")
+            verified += 1
+            pass_results: list[list[dict]] = []
+            for pass_idx in range(passes):
+                try:
+                    pass_results.append(await run_pass(claim, pass_idx))
+                except Exception as e:
+                    logger.warning(
+                        "claim %s pass %s failed: %s", claim.get("id"), pass_idx, e
+                    )
+                    pass_results.append([])
+            if passes == 1:
+                comments = pass_results[0]
+            else:
+                comments = await _aggregate_passes(
+                    pipeline, pool, claim, pass_results, passes
+                )
             # observed yield feeds the replanning committee
             h = getattr(pool, "harness", None)
             if h is not None and comments:
@@ -134,7 +239,9 @@ async def verify_claims(
                 except (TypeError, ValueError):
                     pass
             await pipeline._emit(
-                Stage.VERIFY, StageStatus.RUNNING, f"claim {claim.get('id')} [{ctype}] verified"
+                Stage.VERIFY,
+                StageStatus.RUNNING,
+                f"claim {claim.get('id')} verified ({passes} pass)",
             )
             return comments
 
@@ -149,6 +256,40 @@ async def verify_claims(
             f"claim verification stopped at {verified}/{len(selected)} (budget projection)",
         )
     return results
+
+
+async def _aggregate_passes(
+    pipeline, pool, claim: dict, pass_results: list[list[dict]], passes: int
+) -> list[dict]:
+    """Reproduction voting across independent passes.
+
+    Findings present in >= 2 passes are confirmed with a k-of-n provenance;
+    findings from a single pass go to the strong-model arbitration gate."""
+    clusters: list[dict] = []  # {comments: [...], passes: set[int]}
+    for pi, comments in enumerate(pass_results):
+        for c in comments:
+            placed = False
+            for cl in clusters:
+                if any(_similar_comments(c, oc) for oc in cl["comments"]):
+                    cl["comments"].append(c)
+                    cl["passes"].add(pi)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append({"comments": [c], "passes": {pi}})
+    confirmed: list[dict] = []
+    for cl in clusters:
+        best = max(cl["comments"], key=lambda c: float(c.get("score", 0) or 0))
+        if len(cl["passes"]) >= 2:
+            out = dict(best)
+            out["provenance"] = f"claim_verify {len(cl['passes'])}-of-{passes}"
+            confirmed.append(out)
+        else:
+            kept = await _arbitrate(pipeline, pool, claim, best)
+            if kept is not None:
+                kept["provenance"] = f"claim_verify 1-of-{passes} + arbitrated"
+                confirmed.append(kept)
+    return confirmed
 
 
 def _definitions_for(doc: Document, claim: dict) -> str:

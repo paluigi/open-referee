@@ -36,6 +36,7 @@ class ModelRole(str, Enum):
     SMALL = "small"
     VISION = "vision"
     DECISION = "decision"
+    AUDITOR = "auditor"  # optional cross-model verifier for deep reviews
 
 
 class ProviderConfig(BaseModel):
@@ -61,6 +62,8 @@ class RoleConfig(BaseModel):
     model: str
     temperature: float = 0.2
     max_tokens: int = 4096
+    # reasoning-effort hint where the provider supports it (low|medium|high|xhigh)
+    reasoning_effort: str | None = None
 
 
 class LLMConfig(BaseModel):

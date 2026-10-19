@@ -93,8 +93,10 @@ class OpenAICompatibleProvider(HTTPChatProvider):
             "model": self.spec.model,
             "messages": [{"role": m.role, "content": content_of(m)} for m in messages],
             "temperature": self.spec.temperature,
-            "max_tokens": self.spec.max_tokens,
+            "max_tokens": self.spec.call_max_tokens or self.spec.max_tokens,
         }
+        if self.spec.reasoning_effort:
+            payload["reasoning_effort"] = self.spec.reasoning_effort
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         r = await self._client.post(self._url, json=payload, headers=self._headers)

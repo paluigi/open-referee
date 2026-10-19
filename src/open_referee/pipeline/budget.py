@@ -126,6 +126,9 @@ class PlanKnobs(BaseModel):
     defense_round: bool = True
     max_artifacts: int = 12
     recompute: bool = True  # hybrid formula recomputation (extract->sympy->verify)
+    verify_passes: int = 1  # independent verification passes per claim
+    claim_routing: str = "base"  # base | strong (numerical->strong) | all_strong
+    output_budget: str = "default"  # low | default | high per-call-type budgets
 
     @classmethod
     def from_preset(cls, preset) -> PlanKnobs:
@@ -136,7 +139,50 @@ class PlanKnobs(BaseModel):
             defense_round=preset.defense_round,
             max_artifacts=preset.max_artifacts,
             recompute=getattr(preset, "recompute", True),
+            verify_passes=getattr(preset, "verify_passes", 1),
+            claim_routing=getattr(preset, "claim_routing", "base"),
+            output_budget=getattr(preset, "output_budget", "default"),
         )
+
+
+# per-call-type output budgets by depth level (tokens); calls not listed use
+# the role default. Reasoning-style models need generous budgets or they
+# exhaust the output window mid-thought (observed 2-5x underestimates).
+OUTPUT_BUDGETS: dict[str, dict[str, int]] = {
+    "low": {
+        "claim_inventory": 8192,
+        "claim_verify": 4096,
+        "claim_arbitrate": 2048,
+        "whole_paper_verify": 8192,
+        "whole_paper_challenge": 8192,
+        "meta": 4096,
+        "validate": 4096,
+    },
+    "default": {
+        "claim_inventory": 12288,
+        "claim_verify": 6144,
+        "claim_arbitrate": 3072,
+        "whole_paper_verify": 12288,
+        "whole_paper_challenge": 12288,
+        "section_challenger": 4096,
+        "meta": 6144,
+        "validate": 6144,
+    },
+    "high": {
+        "claim_inventory": 16384,
+        "claim_verify": 12288,
+        "claim_arbitrate": 4096,
+        "whole_paper_verify": 16384,
+        "whole_paper_challenge": 16384,
+        "section_challenger": 6144,
+        "meta": 8192,
+        "validate": 8192,
+    },
+}
+
+
+def call_max_tokens(call_type: str, level: str) -> int | None:
+    return OUTPUT_BUDGETS.get(level, {}).get(call_type)
 
 
 class StageEstimate(BaseModel):
@@ -335,6 +381,8 @@ class BudgetHarness:
                 return ("small", 12_000, 2500)
             case "recompute_verify":
                 return ("strong", 3500, 1200)
+            case "claim_arbitrate":
+                return ("strong", 8000, 1500)
             case "dm_call":
                 return ("decision", 5000, 1)
         return ("small", 4000, 1500)
@@ -367,7 +415,10 @@ class BudgetHarness:
             "claim_inventory": 1,
             "surveyor": 1,
             "planner": 1 + PLANNER_CONTINGENCY_CALLS if self.auto else 0,
-            "claim_verify": claims,
+            "claim_verify": claims * max(1, knobs.verify_passes),
+            "claim_arbitrate": (
+                math.ceil(claims * 0.15) if knobs.verify_passes > 1 else 0
+            ),
             "lens_section": (
                 self.stats.n_sections * max(1, self.stats.n_lenses)
                 if knobs.per_section_lenses

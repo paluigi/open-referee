@@ -37,6 +37,10 @@ class ModelSpec(BaseModel):
     max_tokens: int = 4096
     timeout_s: float = 300.0
     max_retries: int = 3
+    # per-call output-budget override (set by call sites, not by role config)
+    call_max_tokens: int | None = None
+    # reasoning-effort hint where the provider supports it
+    reasoning_effort: str | None = None
 
 
 class LLMError(RuntimeError):

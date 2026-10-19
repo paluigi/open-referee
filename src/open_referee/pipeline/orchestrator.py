@@ -128,11 +128,30 @@ class RolePool:
         return result
 
     async def complete_json(
-        self, role: ModelRole, system: str, user: str, call_type: str = "other"
+        self, role: ModelRole, system: str, user: str, call_type: str = "other",
+        max_tokens: int | None = None,
     ) -> dict:
-        """JSON-mode completion with parse-repair retry, ledger check, usage record."""
+        """JSON-mode completion with parse-repair retry, ledger check, usage record.
+
+        ``max_tokens`` overrides the role's output budget for this call only
+        (per-call-type budgets from the plan's output_budget level)."""
         provider = self.providers[role]
         spec = self.specs[role]
+        override = max_tokens is not None and max_tokens != spec.max_tokens
+        if override:
+            # reuse the live provider (and its HTTP client); restore after
+            provider.spec = spec.model_copy(update={"call_max_tokens": max_tokens})
+        try:
+            return await self._complete_json_inner(
+                provider, spec, role, system, user, call_type
+            )
+        finally:
+            if override:
+                provider.spec = spec
+
+    async def _complete_json_inner(
+        self, provider, spec, role: ModelRole, system: str, user: str, call_type: str
+    ) -> dict:
         est_in = (len(system) + len(user)) // 3
         # rough output estimate: proportional to input, bounded — avoids
         # pre-charging max_tokens/2 on every call and tripping the cap early
@@ -458,7 +477,7 @@ class ReviewPipeline:
     async def _ensure_pool(self) -> RolePool:
         if self._pool is None:
             roles = {ModelRole.STRONG, ModelRole.SMALL}
-            for extra in (ModelRole.VISION, ModelRole.DECISION):
+            for extra in (ModelRole.VISION, ModelRole.DECISION, ModelRole.AUDITOR):
                 try:
                     self.cfg.llm.role(extra)
                     roles.add(extra)
@@ -801,7 +820,10 @@ class ReviewPipeline:
     async def _claim_inventory(self, pool: RolePool, doc: Document, triage: dict) -> list[dict]:
         from open_referee.pipeline.claims import run_claim_inventory
 
-        claims = await run_claim_inventory(pool, doc, triage, self.cfg)
+        claims = await run_claim_inventory(
+            pool, doc, triage, self.cfg,
+            output_budget=str(getattr(self.plan_knobs(), "output_budget", "default")),
+        )
         await self._emit(Stage.CLAIMS, StageStatus.RUNNING, f"{len(claims)} claims catalogued")
         return claims
 

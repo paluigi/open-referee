@@ -37,6 +37,7 @@ STAGE_OF_CALL_TYPE: dict[str, str] = {
     "surveyor": "survey",
     "planner": "plan",
     "claim_verify": "verify",
+    "claim_arbitrate": "verify",
     "lens_section": "verify",
     "artifact_verify": "verify",
     "whole_paper_verify": "verify",
