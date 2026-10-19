@@ -966,10 +966,43 @@ class ReviewPipeline:
         triage: dict,
         claims: list[dict] | None = None,
     ) -> list[dict]:
+        from open_referee.pipeline.checkers import run_deterministic_checks
         from open_referee.pipeline.claims import verify_artifacts, verify_claims
+        from open_referee.pipeline.recompute import run_recompute
 
         knobs = self.plan_knobs()
         candidates: list[dict] = []
+
+        # deterministic checkers: cross-references, number consistency, table
+        # arithmetic — zero LLM cost, findings stored on the run state
+        if not self.state.checker_findings:
+            det = run_deterministic_checks(doc)
+            self.state.checker_findings = [f.to_dict() for f in det]
+            if det:
+                kinds: dict[str, int] = {}
+                for f in det:
+                    kinds[f.check] = kinds.get(f.check, 0) + 1
+                await self._emit(
+                    Stage.VERIFY,
+                    StageStatus.RUNNING,
+                    "deterministic checks: "
+                    + ", ".join(f"{k}×{v}" for k, v in sorted(kinds.items())),
+                )
+        if knobs.recompute and not any(
+            f.get("check") == "recompute" for f in self.state.checker_findings
+        ):
+            try:
+                rec = await run_recompute(self, pool, doc, self.cfg)
+            except Exception as e:  # noqa: BLE001 - checker must never kill a run
+                logger.warning("recompute stage failed: %s", e)
+                rec = []
+            if rec:
+                self.state.checker_findings.extend(f.to_dict() for f in rec)
+                await self._emit(
+                    Stage.VERIFY,
+                    StageStatus.RUNNING,
+                    f"formula recomputation: {len(rec)} confirmed mismatch(es)",
+                )
 
         # per-claim verification workers (the primary engine)
         if claims:
@@ -1166,10 +1199,12 @@ class ReviewPipeline:
         }
         if not doc.references_text:
             return empty
+        resolution = await self._resolve_references(doc)
         intext = _extract_intext_citations(doc)
         user = prompts.BIBLIOGRAPHY_USER.format(
             references=doc.references_text[:30_000],
             intext=intext[:15_000],
+            resolution=resolution,
             context=pack.render(max_items=25),
         )
         try:
@@ -1181,6 +1216,45 @@ class ReviewPipeline:
         except LLMError as e:
             logger.warning("bibliography audit failed: %s", e)
             return empty
+
+    async def _resolve_references(self, doc: Document) -> str:
+        """Free deterministic Crossref/OpenAlex pass over the reference list.
+
+        Results are stored on the run state as ground truth and rendered into
+        the bibliography prompt; unmatched entries become phantom-candidate
+        findings in the checker stream."""
+        if self.state.doi_resolutions:
+            return _render_resolutions(self.state.doi_resolutions)
+        from open_referee.literature.reference_resolution import resolve_references
+
+        try:
+            records = await resolve_references(doc.references_text or "", self.cfg)
+        except Exception as e:  # noqa: BLE001 - resolution is best-effort
+            logger.warning("reference resolution failed: %s", e)
+            records = []
+        self.state.doi_resolutions = records
+        unmatched = [r for r in records if r.get("status") != "matched"]
+        if unmatched:
+            from open_referee.pipeline.checkers import CheckFinding
+
+            for r in unmatched[:20]:
+                self.state.checker_findings.append(
+                    CheckFinding(
+                        check="doi-resolution",
+                        title="Reference not resolvable in Crossref/OpenAlex",
+                        message=(
+                            "The bibliography entry below could not be matched to "
+                            "any Crossref or OpenAlex record (best score "
+                            f"{r.get('score', 0)}). It may be phantom, garbled, or "
+                            "use an unusual rendering — verify it exists."
+                        ),
+                        quote=str(r.get("ref", ""))[:240],
+                        category="reference",
+                        severity=0.4,
+                        meta={"kind": "unmatched", "score": r.get("score", 0)},
+                    ).to_dict()
+                )
+        return _render_resolutions(records)
 
     async def _meta(self, pool, doc, triage, validated, bib, pack) -> dict:
         bib_summary = {
@@ -1447,7 +1521,9 @@ _FALLBACK_MD_RE = re.compile(r"^#{1,3}\s+(\S.*)$")  # markdown
 _FALLBACK_NUM_RE = re.compile(
     r"^(?:\d{1,2}(?:\.\d+)*\.?|Appendix\s+[A-Z])\s+[A-Z].{2,120}$"
 )  # numbered section lines
-_FALLBACK_KW_RE = re.compile(r"^(?:abstract|references|bibliography|appendix|conclusions?)\s*$", re.I)
+_FALLBACK_KW_RE = re.compile(
+    r"^(?:abstract|references|bibliography|appendix|conclusions?)\s*$", re.I
+)
 _FALLBACK_CAPS_RE = re.compile(r"^[A-Z][A-Z0-9 :&\-]{3,60}$")
 _FALLBACK_MIN_CHARS = 400
 _FALLBACK_MAX_SECTIONS = 20
@@ -1491,7 +1567,7 @@ def _split_by_headings(text: str) -> list[tuple[str, str]]:
         titles.append(title)
 
     out: list[tuple[str, str]] = []
-    for title, chunk_lines in zip(titles, sections):
+    for title, chunk_lines in zip(titles, sections, strict=True):
         chunk = "\n".join(chunk_lines).strip()
         if not chunk:
             continue
@@ -1511,3 +1587,18 @@ def _hit_to_item(hit, why: str):
     return LiteratureItem(
         source="web", title=hit.title, url=hit.url, abstract=hit.snippet, why_relevant=why
     )
+
+
+def _render_resolutions(records: list[dict]) -> str:
+    if not records:
+        return "(resolution unavailable)"
+    lines = []
+    for r in records:
+        if r.get("status") == "matched":
+            lines.append(
+                f"- MATCHED {r.get('doi') or 'no-doi'} :: {str(r.get('title'))[:110]} "
+                f"({r.get('venue') or '?'}, {r.get('year') or '?'}) [score {r.get('score')}]"
+            )
+        else:
+            lines.append(f"- UNMATCHED :: {str(r.get('ref'))[:110]} [best score {r.get('score')}]")
+    return "\n".join(lines)[:20_000]

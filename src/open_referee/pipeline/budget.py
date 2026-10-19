@@ -125,6 +125,7 @@ class PlanKnobs(BaseModel):
     whole_paper_passes: bool = True
     defense_round: bool = True
     max_artifacts: int = 12
+    recompute: bool = True  # hybrid formula recomputation (extract->sympy->verify)
 
     @classmethod
     def from_preset(cls, preset) -> PlanKnobs:
@@ -134,6 +135,7 @@ class PlanKnobs(BaseModel):
             whole_paper_passes=preset.whole_paper_passes,
             defense_round=preset.defense_round,
             max_artifacts=preset.max_artifacts,
+            recompute=getattr(preset, "recompute", True),
         )
 
 
@@ -329,6 +331,10 @@ class BudgetHarness:
                 return ("small", 6000, 1200)
             case "wrapup":
                 return ("strong", m + 80_000 // CHARS_PER_TOKEN + 1500, 4000)
+            case "recompute_extract":
+                return ("small", 12_000, 2500)
+            case "recompute_verify":
+                return ("strong", 3500, 1200)
             case "dm_call":
                 return ("decision", 5000, 1)
         return ("small", 4000, 1500)
@@ -378,6 +384,8 @@ class BudgetHarness:
             "defense": self._est_comments(knobs) if knobs.defense_round else 0,
             "adjudication": self._est_comments(knobs) if knobs.defense_round else 0,
             "bibliography": 1 if self.stats.n_references else 0,
+            "recompute_extract": 1 if knobs.recompute else 0,
+            "recompute_verify": 3 if knobs.recompute else 0,
             "meta": 1,
             "validate": 1,
         }
@@ -411,6 +419,7 @@ class BudgetHarness:
             whole_paper_passes=False,
             defense_round=False,
             max_artifacts=0,
+            recompute=False,
         )
 
     def _cost_of(self, knobs: PlanKnobs) -> float:
@@ -450,6 +459,7 @@ class BudgetHarness:
         for update in (
             {"whole_paper_passes": True},
             {"defense_round": True},
+            {"recompute": True},
             {"per_section_lenses": True},
             {"max_artifacts": min(12, self.stats.n_figures + self.stats.n_tables)},
         ):

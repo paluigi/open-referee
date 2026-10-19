@@ -346,6 +346,14 @@ In-text citation mentions found in the manuscript (claim context may be truncate
 {intext}
 ---
 
+Deterministic DOI resolution (Crossref/OpenAlex ground truth; MATCHED records
+name the real work behind an entry — an entry you would call not_found despite
+a MATCH here is mis-parsed, not phantom; UNMATCHED entries found no record and
+are the phantom candidates):
+---
+{resolution}
+---
+
 Context pack:
 ---
 {context}

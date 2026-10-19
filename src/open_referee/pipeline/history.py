@@ -40,6 +40,8 @@ STAGE_OF_CALL_TYPE: dict[str, str] = {
     "lens_section": "verify",
     "artifact_verify": "verify",
     "whole_paper_verify": "verify",
+    "recompute_extract": "verify",
+    "recompute_verify": "verify",
     "section_challenger": "challenge",
     "whole_paper_challenge": "challenge",
     "defense": "challenge",

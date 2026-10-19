@@ -73,6 +73,9 @@ class RunState(BaseModel):
     journal_profile: str | None = None  # free-form venue profile text
     plan: dict[str, Any] | None = None  # serialized ReviewPlan (budget tracking)
     ledger_calls: list[dict[str, Any]] = Field(default_factory=list)  # persisted CallRecords
+    # deterministic checker output + DOI-resolution ground truth (free stages)
+    checker_findings: list[dict[str, Any]] = Field(default_factory=list)
+    doi_resolutions: list[dict[str, Any]] = Field(default_factory=list)
 
     def model_post_init(self, __context) -> None:
         # normalize stage dict entries back to StageStatus after JSON round-trip
