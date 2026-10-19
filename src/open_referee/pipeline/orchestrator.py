@@ -1165,6 +1165,11 @@ class ReviewPipeline:
                 except LLMError as e:
                     logger.warning("challenger failed on %s: %s", title, e)
                     return cands
+                if isinstance(res, list):
+                    # bare validated list instead of the documented envelope
+                    res = {"validated": res}
+                if not isinstance(res, dict):
+                    res = {}
                 kept = [
                     c
                     for c in res.get("validated", [])
@@ -1212,6 +1217,12 @@ class ReviewPipeline:
                 wp_user,
                 call_type="whole_paper_challenge",
             )
+            # models sometimes return the validated list bare instead of the
+            # documented {"validated": [...], "new_comments": [...]} envelope
+            if isinstance(wp, list):
+                wp = {"validated": wp}
+            if not isinstance(wp, dict):
+                wp = {}
             kept = [
                 c
                 for c in wp.get("validated", [])
