@@ -77,7 +77,7 @@ class LLMConfig(BaseModel):
     # "always" skips the single-call attempt, "never" disables.
     json_two_phase: str = "auto"
     json_phase_reasoning_effort: str = "low"  # emission control for phase 2
-    json_phase_max_tokens: int = 16384  # phase-1 (free-form reasoning) budget
+    json_phase_max_tokens: int = 24576  # phase-1 (free-form reasoning) budget
 
     @field_validator("roles", mode="before")
     @classmethod
