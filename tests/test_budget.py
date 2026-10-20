@@ -124,7 +124,8 @@ async def test_deterministic_plan_fits_budget():
 
 async def test_more_budget_buys_more_claims():
     stats = DocumentStats(chars=200_000, n_sections=10, n_claims=80, n_references=40)
-    h_small, _ = make_harness(budget=2.0, stats=stats)
+    # 200k chars -> chunked inventory (2 calls) sits in the floor now
+    h_small, _ = make_harness(budget=2.5, stats=stats)
     h_big, _ = make_harness(budget=50.0, stats=stats)
     small = h_small.deterministic_plan()
     big = h_big.deterministic_plan()

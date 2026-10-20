@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from open_referee.config import Config, LLMConfig, ModelRole, ProviderConfig, RoleConfig
@@ -30,7 +28,6 @@ class ScriptedProvider:
         self.calls: list[dict] = []
 
     async def complete(self, messages, json_mode=False):
-        import copy
 
         self.calls.append(
             {

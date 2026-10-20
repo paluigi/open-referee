@@ -278,3 +278,35 @@ def test_passage_for_returns_context():
     p = _passage_for(doc, "All widgets are stable")
     assert p and "widget" in p.lower()
     assert _passage_for(doc, "zzz not present") is None
+
+
+@pytest.mark.asyncio
+async def test_chunked_claim_inventory_merges_ids(test_config, monkeypatch):
+    """Manuscripts beyond 70k chars are catalogued in two chunk calls whose
+    claims merge under global ids; a failing chunk degrades, not kills."""
+    from open_referee.config import ModelRole
+    from open_referee.pipeline.claims import run_claim_inventory
+
+    md = "# Big paper\n\n" + (
+        "## Section one\n\n" + ("claim text one. " * 2400) + "\n\n"
+        "## Section two\n\n" + ("claim text two. " * 2400) + "\n\n"
+        "## Section three\n\n" + ("claim text three. " * 2400)
+    )
+    doc = document_from_markdown(md, source_format="md", title_hint="big")
+    assert len(doc.full_text()) > 70_000
+
+    pool = RolePool.build(test_config, {ModelRole.STRONG})
+    strong = pool.providers[ModelRole.STRONG]
+    strong.queue(json.dumps({"claims": [
+        {"id": "x1", "type": "logical", "components": {"s": "a"},
+         "anchor": "claim text one", "section": "1", "importance": "central"},
+    ]}))
+    strong.queue(json.dumps({"claims": [
+        {"components": {"s": "b"}, "anchor": "claim text three"},
+    ]}))
+
+    out = await run_claim_inventory(pool, doc, {"domain": "d"}, test_config)
+    assert [c["id"] for c in out] == ["cl001", "cl002"]
+    assert out[1]["anchor"] == "claim text three"
+    assert len(strong.calls) == 2  # two chunk calls
+    await pool.close()

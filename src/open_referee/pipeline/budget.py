@@ -427,7 +427,7 @@ class BudgetHarness:
         has_vision = ModelRole.VISION in self.specs
         counts = {
             "triage": 1,
-            "claim_inventory": 1,
+            "claim_inventory": 2 if self.stats.chars > 70_000 else 1,
             "surveyor": 1,
             "planner": 1 + PLANNER_CONTINGENCY_CALLS if self.auto else 0,
             "claim_verify": claims * max(1, knobs.verify_passes),

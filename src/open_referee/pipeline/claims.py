@@ -39,40 +39,76 @@ CLAIM_TYPE_ROLES = {
 }
 
 
+CHUNK_CHARS = 70_000  # single-prompt inputs beyond this get chunked
+
+
+def _inventory_chunks(doc: Document) -> list[str]:
+    """Manuscript text for the inventory, split at section boundaries when
+    large: keeps each prompt in the regime where reasoning models reliably
+    emit JSON (~20k tokens), instead of one 40k-token prompt."""
+    text = doc.full_text()[:MAX_MANUSCRIPT_CHARS]
+    if len(text) <= CHUNK_CHARS:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= CHUNK_CHARS * 1.2:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind("\n\n", 0, CHUNK_CHARS)
+        if cut < CHUNK_CHARS // 2:
+            cut = CHUNK_CHARS
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip()
+    return [c for c in chunks if len(c) > 500]
+
+
 async def run_claim_inventory(
     pool: RolePool, doc: Document, triage: dict, cfg: Config, output_budget: str = "default"
 ) -> list[dict]:
-    """CLAIMS stage: exhaustive atomic claim catalogue for the manuscript."""
+    """CLAIMS stage: exhaustive atomic claim catalogue for the manuscript.
+
+    Long manuscripts are catalogued chunk-by-chunk at section boundaries and
+    merged — smaller prompts keep reasoning models in the reliable-emission
+    regime and the catalogue gets fuller coverage of the back half."""
     from open_referee.pipeline.budget import call_max_tokens
 
-    user = prompts_claims.CLAIM_INVENTORY_USER.format(
-        title=doc.title,
-        triage_json=json.dumps(triage)[:3000],
-        manuscript=doc.full_text()[:MAX_MANUSCRIPT_CHARS],
-    )
-    try:
-        res = await pool.complete_json(
-            ModelRole.STRONG,
-            prompts_claims.CLAIM_INVENTORY_SYSTEM,
-            user,
-            call_type="claim_inventory",
-            max_tokens=call_max_tokens("claim_inventory", output_budget),
+    out: list[dict] = []
+    n = 0
+    chunks = _inventory_chunks(doc)
+    for ci, chunk in enumerate(chunks, 1):
+        user = prompts_claims.CLAIM_INVENTORY_USER.format(
+            title=doc.title,
+            triage_json=json.dumps(triage)[:3000],
+            manuscript=chunk,
         )
-    except Exception as e:
-        logger.warning("claim inventory failed: %s", e)
-        return []
-    claims = res.get("claims", [])
-    if not isinstance(claims, list):
-        return []
-    # basic sanitation
-    out = []
-    for i, c in enumerate(claims):
-        if not isinstance(c, dict) or not c.get("components"):
+        if len(chunks) > 1:
+            user += (
+                f"\n\n[Manuscript part {ci} of {len(chunks)}; catalogue "
+                "the claims of THIS part; ids will be merged globally.]"
+            )
+        try:
+            res = await pool.complete_json(
+                ModelRole.STRONG,
+                prompts_claims.CLAIM_INVENTORY_SYSTEM,
+                user,
+                call_type="claim_inventory",
+                max_tokens=call_max_tokens("claim_inventory", output_budget),
+            )
+        except Exception as e:
+            logger.warning("claim inventory chunk %d failed: %s", ci, e)
             continue
-        c.setdefault("id", f"cl{i + 1:03d}")
-        c.setdefault("type", "logical")
-        c.setdefault("importance", "supporting")
-        out.append(c)
+        claims = res.get("claims", []) if isinstance(res, dict) else []
+        if not isinstance(claims, list):
+            continue
+        for c in claims:
+            if not isinstance(c, dict) or not c.get("components"):
+                continue
+            n += 1
+            c["id"] = f"cl{n:03d}"  # global ids across merged chunks
+            c.setdefault("type", "logical")
+            c.setdefault("importance", "supporting")
+            out.append(c)
     return out
 
 
