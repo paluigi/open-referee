@@ -255,6 +255,31 @@ class RolePool:
                 pass  # fall through: repair, then two-phase if content was empty
         # exhaustion signature: empty content (reasoning ate the budget)
         empty_content = resp is None or not (resp.text or "").strip()
+        if mode == "auto" and empty_content:
+            # cheap escalation first: same call under the low-effort control
+            # (survey + live probes: reasoning spiral short-circuits, valid
+            # JSON in seconds) before the expensive free-form phase
+            emission_effort = str(
+                getattr(self.cfg.llm, "json_phase_reasoning_effort", "low")
+            )
+            saved_spec = provider.spec
+            try:
+                provider.spec = spec.model_copy(update={"reasoning_effort": emission_effort})
+                resp_low = await provider.complete(messages, json_mode=True)
+                rec_low = await self.ledger.record(
+                    spec, role.value, resp_low, call_type=call_type
+                )
+                if self.harness is not None:
+                    self.harness.note_record(rec_low)
+            finally:
+                provider.spec = saved_spec
+            if (resp_low.text or "").strip():
+                from open_referee.providers.adapters import extract_json
+
+                try:
+                    return extract_json(resp_low.text)
+                except json.JSONDecodeError:
+                    pass
         if mode == "always" or (mode == "auto" and empty_content):
             try:
                 out = await self._two_phase_json(provider, spec, role, system, user, call_type)

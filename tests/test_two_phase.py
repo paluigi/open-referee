@@ -72,6 +72,7 @@ async def test_auto_escalates_on_empty_content():
         spec,
         [
             (True, "", 4096),  # single-call attempt: exhausted (empty, cap)
+            (True, "", 200),  # low-effort retry: also empty here
             (False, "The analysis: the theorem lacks a boundedness step...", 9000),
             (True, '{"ok": true, "n": 2}', 120),
         ],
@@ -80,17 +81,18 @@ async def test_auto_escalates_on_empty_content():
     out = await pool.complete_json(ModelRole.STRONG, "s", "u", call_type="meta")
     assert out == {"ok": True, "n": 2}
     modes = [c["json_mode"] for c in provider.calls]
-    assert modes == [True, False, True]  # single attempt, reasoning, emission
-    # phase 2 emission runs with the low-effort control
-    assert provider.calls[2]["spec"].reasoning_effort == "low"
+    assert modes == [True, True, False, True]  # attempt, low retry, reasoning, emission
+    # low retry and phase-2 emission run with the low-effort control
+    assert provider.calls[1]["spec"].reasoning_effort == "low"
+    assert provider.calls[3]["spec"].reasoning_effort == "low"
     # phase 1 reasoning ran with the generous phase budget
-    assert provider.calls[1]["spec"].call_max_tokens == 16384
+    assert provider.calls[2]["spec"].call_max_tokens == 16384
     # phase 2 prompt carries the analysis
     assert "prior analysis" in provider.calls[2]["user_tail"] or len(
         provider.calls[2]["user_tail"]
     ) > 0
-    # all three calls ledger-recorded under the same call type
-    assert len(pool.ledger.calls) == 3
+    # all four calls ledger-recorded under the same call type
+    assert len(pool.ledger.calls) == 4
     assert all(c.call_type == "meta" for c in pool.ledger.calls)
 
 
@@ -143,14 +145,15 @@ async def test_phase1_also_empty_falls_back_to_repair():
         spec,
         [
             (True, "", 4096),  # single attempt exhausted
-            (False, "", 16384),  # phase-1 reasoning also exhausted
+            (True, "", 300),  # low-effort retry empty
+            (False, "", 24576),  # phase-1 reasoning also exhausted
             (True, '{"ok": 4}', 20),  # repair ladder saves it
         ],
     )
     pool = _pool(provider, spec)
     out = await pool.complete_json(ModelRole.STRONG, "s", "u", call_type="meta")
     assert out == {"ok": 4}
-    assert len(pool.ledger.calls) == 3
+    assert len(pool.ledger.calls) == 4
 
 
 @pytest.mark.asyncio
@@ -158,7 +161,12 @@ async def test_spec_restored_after_two_phase():
     spec = _spec()
     provider = ScriptedProvider(
         spec,
-        [(True, "", 4096), (False, "analysis", 500), (True, '{"ok": 5}', 10)],
+        [
+            (True, "", 4096),
+            (True, "", 100),
+            (False, "analysis", 500),
+            (True, '{"ok": 5}', 10),
+        ],
     )
     pool = _pool(provider, spec)
     await pool.complete_json(ModelRole.STRONG, "s", "u", call_type="meta")
