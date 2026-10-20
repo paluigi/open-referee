@@ -85,7 +85,9 @@ async def run_claim_inventory(
         if len(chunks) > 1:
             user += (
                 f"\n\n[Manuscript part {ci} of {len(chunks)}; catalogue "
-                "the claims of THIS part; ids will be merged globally.]"
+                "the claims of THIS part; ids will be merged globally. Keep "
+                "each claim's components TERSE (<=60 words total) and report "
+                "at most 30 claims per part — the most important ones.]"
             )
         try:
             res = await pool.complete_json(
