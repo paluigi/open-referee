@@ -136,7 +136,15 @@ class RolePool:
         ``max_tokens`` overrides the role's output budget for this call only;
         when omitted, the per-call-type budget from the plan's output_budget
         level applies automatically (falling back to the role default for
-        unlisted call types)."""
+        unlisted call types).
+
+        Reasoning models can exhaust the output budget thinking before any
+        JSON is emitted (empty content). With llm.json_two_phase = "auto"
+        that signature escalates to a two-phase completion — phase 1 reasons
+        free-form (no JSON pressure, llm.json_phase_max_tokens budget),
+        phase 2 re-emits with llm.json_phase_reasoning_effort — validated by
+        the 2026-10-20 cross-provider survey (reasoning_effort low fixed
+        every failing family; thinking-disabled did not)."""
         from open_referee.pipeline.budget import call_max_tokens
 
         if max_tokens is None:
@@ -147,20 +155,81 @@ class RolePool:
             max_tokens = call_max_tokens(call_type, level)
         provider = self.providers[role]
         spec = self.specs[role]
+        eff_mt = max_tokens if max_tokens is not None else spec.max_tokens
         override = max_tokens is not None and max_tokens != spec.max_tokens
         if override:
             # reuse the live provider (and its HTTP client); restore after
             provider.spec = spec.model_copy(update={"call_max_tokens": max_tokens})
         try:
             return await self._complete_json_inner(
-                provider, spec, role, system, user, call_type
+                provider, spec, role, system, user, call_type, eff_mt
             )
         finally:
             if override:
                 provider.spec = spec
 
-    async def _complete_json_inner(
+    def _json_two_phase_mode(self) -> str:
+        cfg = getattr(self, "cfg", None)
+        mode = getattr(getattr(cfg, "llm", None), "json_two_phase", "auto")
+        return mode if mode in ("auto", "always", "never") else "auto"
+
+    async def _two_phase_json(
         self, provider, spec, role: ModelRole, system: str, user: str, call_type: str
+    ) -> dict | None:
+        """Phase 1: free-form reasoning. Phase 2: low-effort JSON emission
+        fed with the phase-1 analysis. Returns None when phase 1 also fails
+        (caller falls back to the single-call ladder)."""
+        messages = [
+            ChatMessage(role="system", content=system),
+            ChatMessage(role="user", content=user),
+        ]
+        p1_budget = max(
+            int(getattr(self.cfg.llm, "json_phase_max_tokens", 16384)), spec.max_tokens
+        )
+        saved = provider.spec
+        try:
+            provider.spec = spec.model_copy(update={"call_max_tokens": p1_budget})
+            resp1 = await provider.complete(messages, json_mode=False)
+            rec1 = await self.ledger.record(spec, role.value, resp1, call_type=call_type)
+            if self.harness is not None:
+                self.harness.note_record(rec1)
+        finally:
+            provider.spec = saved
+        analysis = (resp1.text or "").strip()
+        if not analysis:
+            return None
+
+        from open_referee.providers.adapters import extract_json
+
+        emission_effort = str(getattr(self.cfg.llm, "json_phase_reasoning_effort", "low"))
+        emit_system = (
+            system
+            + "\n\nYou are given your own prior analysis of the task. Output ONLY "
+            "the required JSON object now — no prose, no code fences, no reasoning."
+        )
+        emit_user = (
+            f"Your prior analysis:\n----\n{analysis[-8000:]}\n----\n\n{user}\n\n"
+            "Based on the analysis above, output ONLY the required JSON now."
+        )
+        try:
+            provider.spec = spec.model_copy(update={"reasoning_effort": emission_effort})
+            resp2 = await provider.complete(
+                [
+                    ChatMessage(role="system", content=emit_system),
+                    ChatMessage(role="user", content=emit_user),
+                ],
+                json_mode=True,
+            )
+            rec2 = await self.ledger.record(spec, role.value, resp2, call_type=call_type)
+            if self.harness is not None:
+                self.harness.note_record(rec2)
+        finally:
+            provider.spec = saved
+        return extract_json(resp2.text)
+
+    async def _complete_json_inner(
+        self, provider, spec, role: ModelRole, system: str, user: str, call_type: str,
+        eff_mt: int | None = None,
     ) -> dict:
         est_in = (len(system) + len(user)) // 3
         # rough output estimate: proportional to input, bounded — avoids
@@ -171,38 +240,60 @@ class RolePool:
             ChatMessage(role="system", content=system),
             ChatMessage(role="user", content=user),
         ]
-        resp = await provider.complete(messages, json_mode=True)
-        rec = await self.ledger.record(spec, role.value, resp, call_type=call_type)
-        if self.harness is not None:
-            self.harness.note_record(rec)
+        mode = self._json_two_phase_mode()
+        resp = None
+        if mode != "always":
+            resp = await provider.complete(messages, json_mode=True)
+            rec = await self.ledger.record(spec, role.value, resp, call_type=call_type)
+            if self.harness is not None:
+                self.harness.note_record(rec)
+            from open_referee.providers.adapters import extract_json
+
+            try:
+                return extract_json(resp.text)
+            except json.JSONDecodeError:
+                pass  # fall through: repair, then two-phase if content was empty
+        # exhaustion signature: empty content (reasoning ate the budget)
+        empty_content = resp is None or not (resp.text or "").strip()
+        if mode == "always" or (mode == "auto" and empty_content):
+            try:
+                out = await self._two_phase_json(provider, spec, role, system, user, call_type)
+                if isinstance(out, dict):
+                    return out
+            except json.JSONDecodeError:
+                pass  # fall through to the repair ladder
+            except LLMError as e:
+                logger.warning("two-phase emission failed: %s", e)
         from open_referee.providers.adapters import extract_json
 
         try:
-            return extract_json(resp.text)
+            if resp is not None:
+                return extract_json(resp.text)
         except json.JSONDecodeError:
-            repair_user = (
-                f"{user}\n\nYour previous reply was not valid JSON. Reply again with ONLY the "
-                f"required JSON object, no prose, no code fences."
-            )
-            resp2 = await provider.complete(
-                [
-                    ChatMessage(role="system", content=system),
-                    ChatMessage(role="user", content=repair_user),
-                ],
-                json_mode=True,
-            )
-            rec2 = await self.ledger.record(spec, role.value, resp2, call_type=call_type)
-            if self.harness is not None:
-                self.harness.note_record(rec2)
-            try:
-                return extract_json(resp2.text)
-            except json.JSONDecodeError as e:
-                # never leak a raw decode error: stages catch LLMError and
-                # degrade gracefully instead of failing the whole run
-                raise LLMError(
-                    f"{spec.provider_name}/{spec.model} returned no parseable JSON even "
-                    f"after a repair attempt (last reply started: {resp2.text[:120]!r})"
-                ) from e
+            pass
+        repair_user = (
+            f"{user}\n\nYour previous reply was not valid JSON. Reply again with ONLY the "
+            f"required JSON object, no prose, no code fences."
+        )
+        resp2 = await provider.complete(
+            [
+                ChatMessage(role="system", content=system),
+                ChatMessage(role="user", content=repair_user),
+            ],
+            json_mode=True,
+        )
+        rec2 = await self.ledger.record(spec, role.value, resp2, call_type=call_type)
+        if self.harness is not None:
+            self.harness.note_record(rec2)
+        try:
+            return extract_json(resp2.text)
+        except json.JSONDecodeError as e:
+            # never leak a raw decode error: stages catch LLMError and
+            # degrade gracefully instead of failing the whole run
+            raise LLMError(
+                f"{spec.provider_name}/{spec.model} returned no parseable JSON even "
+                f"after a repair attempt (last reply started: {resp2.text[:120]!r})"
+            ) from e
 
     async def close(self) -> None:
         for p in self.providers.values():

@@ -72,6 +72,12 @@ class LLMConfig(BaseModel):
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
     request_timeout_s: float = 300.0
     max_retries: int = 3
+    # Two-phase JSON completion for reasoning models: "auto" escalates when a
+    # json_mode call returns empty content (reasoning consumed the budget),
+    # "always" skips the single-call attempt, "never" disables.
+    json_two_phase: str = "auto"
+    json_phase_reasoning_effort: str = "low"  # emission control for phase 2
+    json_phase_max_tokens: int = 16384  # phase-1 (free-form reasoning) budget
 
     @field_validator("roles", mode="before")
     @classmethod
