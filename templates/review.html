@@ -100,6 +100,20 @@
       <h2>Overall feedback</h2>
       <div class="prose">{% for line in report.overall_feedback.split('\n') %}{% if line.startswith('## ') %}<h3>{{ line[3:] }}</h3>{% elif line.startswith('# ') %}<h2>{{ line[2:] }}</h2>{% elif line.strip() %}<p>{{ line }}</p>{% endif %}{% endfor %}</div>
       {% if report.validator_notes %}<h2>Validator notes</h2><div class="prose muted">{{ report.validator_notes }}</div>{% endif %}
+      {% if report.copyedit_items %}
+      <h2>Suggested language fixes ({{ report.copyedit_items|length }})</h2>
+      <p class="muted small">Mechanical language items from the copyedit pass — typos, grammar, phrasing, terminology. Quotes are verified to appear in the manuscript; copyedits, not findings.</p>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>#</th><th>Kind</th><th>Location</th><th>Original</th><th>Suggested fix</th></tr></thead>
+          <tbody>
+          {% for it in report.copyedit_items %}
+            <tr><td>{{ loop.index }}</td><td>{{ it.kind }}</td><td>{{ it.section or '—' }}</td><td>{{ it.quote }}</td><td>{{ it.suggestion }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
       {% if report.plan_summary %}
       <h2>Budget</h2>
       <p class="muted">

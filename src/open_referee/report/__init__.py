@@ -2,6 +2,7 @@
 
 from open_referee.report.models import (
     Attribution,
+    CopyeditItem,
     FitFactor,
     FitReport,
     PlanSummary,
@@ -18,6 +19,7 @@ from open_referee.report.render import (
 
 __all__ = [
     "ReviewReport",
+    "CopyeditItem",
     "ReviewComment",
     "FitReport",
     "FitFactor",

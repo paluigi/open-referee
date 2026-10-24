@@ -139,6 +139,23 @@ def render_markdown(report: ReviewReport) -> str:
             parts += ["", c.message, ""]
     if report.validator_notes:
         parts += ["## Validator notes", "", report.validator_notes, ""]
+    if report.copyedit_items:
+        parts += [
+            f"## Suggested language fixes ({len(report.copyedit_items)})",
+            "",
+            "_Mechanical language items from the copyedit pass — typos, grammar, "
+            "phrasing, terminology. Each quote is verified to appear in the "
+            "manuscript; these are copyedits, not findings, and carry no "
+            "severity._",
+            "",
+            "| # | Kind | Location | Original | Suggested fix |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for i, it in enumerate(report.copyedit_items, 1):
+            q = it.quote.replace("|", "\\|").replace("\n", " ")
+            s = it.suggestion.replace("|", "\\|").replace("\n", " ")
+            parts.append(f"| {i} | {it.kind} | {it.section or '—'} | {q} | {s} |")
+        parts.append("")
     if report.plan_summary:
         parts += _plan_lines(report.plan_summary)
     parts += _usage_table(report.usage, report.model_roles)

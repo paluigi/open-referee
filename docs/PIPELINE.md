@@ -31,6 +31,8 @@ flowchart TD
         BIB --> META[meta merge<br/>+ checker findings]
         META --> SYN[synthesis: lead-referee essay]
         SYN --> VAL[dm_validate gate + validator]
+    VAL --> CE[copyedit annex<br/>verbatim language fixes]
+    CE --> ASM[assemble + report]
         VAL --> ASM[assemble + report]
     end
     CK1 -. replan .-> RF[rebuild residual frontier<br/>DM choice / LLM consult]
@@ -82,6 +84,7 @@ cost model's functions of document stats (chars C, sections S, claims N).
 | synthesis | meta | strong | lead-referee essay: 4-6 argued themes over deduped comments | ~18k / ~6k | comments |
 | dm_validate | validate | decision | grounded-quote predicate per comment (60-question batches) | comments/3 / 1 | comments |
 | validate | validate | strong | final gate over survivors | C/3+27k / ~4k | C |
+| copyedit | copyedit | small | language-mechanics annex: verbatim typo/phrasing fixes, deterministically anchored (no severity/defense gating) | C/3+0.8k / ~5k | C |
 | assemble | assemble | — | anchor resolution, exports (free) | 0 | — |
 | wrapup | any | strong | incomplete-review synthesis (reserve-funded) | C/3+28k / ~4k | C |
 | fit_assessment | fit | strong | six factor analyses (≤600 tok each) + reasoning | C/3+2k / ~4k | C |
@@ -137,6 +140,7 @@ estimate-vs-actual per stage.
 | artifacts | 6 | 12 | 50 |
 | output budgets | low | default | high |
 | synthesis | concise | lead-referee essay | lead-referee essay |
+| copyedit annex | yes | yes | yes |
 
 ## Budget-driven mode (auto)
 

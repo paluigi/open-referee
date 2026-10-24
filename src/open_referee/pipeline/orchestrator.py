@@ -49,7 +49,7 @@ from open_referee.providers import (
     UsageLedger,
 )
 from open_referee.report import ReviewComment, ReviewReport
-from open_referee.report.models import PlanSummary, UsageSummary
+from open_referee.report.models import CopyeditItem, PlanSummary, UsageSummary
 from open_referee.report.render import render_markdown, render_pdf
 
 logger = logging.getLogger(__name__)
@@ -501,8 +501,12 @@ class ReviewPipeline:
             final = await self._stage_or_resume(
                 Stage.VALIDATE, lambda: self._validate(pool, doc, draft), skip_key="final_review"
             )
+            # 9b. copyedit annex (language mechanics; never blocks the report)
+            copyedit_items = await self._stage_or_resume(
+                Stage.COPYEDIT, lambda: self._copyedit(pool, doc), skip_key="copyedit_items"
+            )
             # 10. assemble
-            report = await self._assemble(final, doc)
+            report = await self._assemble(final, doc, copyedit_items)
             state.status = "completed"
             state.save()
             await self._emit(Stage.ASSEMBLE, StageStatus.DONE, "report ready")
@@ -1582,7 +1586,55 @@ class ReviewPipeline:
         result.setdefault("comments", draft.get("comments", []))
         return result
 
-    async def _assemble(self, final: dict, doc: Document) -> ReviewReport:
+    async def _copyedit(self, pool, doc: Document) -> list[dict]:
+        """Language-mechanics annex: one small-model pass producing verbatim
+        typo/phrasing fixes. Quotes are verified against the document with
+        the deterministic anchor resolver — items whose quotes cannot be
+        located are dropped (hallucination guard); no severity/defense/
+        validation gating applies (nothing here is a finding)."""
+        if not getattr(self.plan_knobs(), "copyedit", True):
+            return []
+        if not self.budget_allows("copyedit"):
+            self._note_gate_stop("copyedit")
+            return []
+        user = prompts.COPYEDIT_USER.format(
+            title=doc.title, manuscript=self._manuscript_trunc(doc)
+        )
+        try:
+            res = await pool.complete_json(
+                ModelRole.SMALL, prompts.COPYEDIT_SYSTEM, user, call_type="copyedit"
+            )
+        except LLMError as e:
+            logger.warning("copyedit pass failed: %s", e)
+            return []
+        raw = res.get("items", []) if isinstance(res, dict) else []
+        out: list[dict] = []
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            quote = str(it.get("quote", "")).strip()
+            suggestion = str(it.get("suggestion", "")).strip()
+            kind = str(it.get("kind", "phrasing")).strip().lower()
+            if not quote or not suggestion or kind not in (
+                "typo", "grammar", "phrasing", "terminology"
+            ):
+                continue
+            block_id, _conf = _resolve_anchor(doc, quote, quote)
+            if block_id is None:
+                continue  # quote not in the document — likely paraphrased
+            out.append(
+                {
+                    "quote": quote[:300],
+                    "suggestion": suggestion[:300],
+                    "kind": kind,
+                    "section": _section_of_block(doc, block_id),
+                }
+            )
+            if len(out) >= 40:
+                break
+        return out
+
+    async def _assemble(self, final: dict, doc: Document, copyedit_items=None) -> ReviewReport:
         comments: list[ReviewComment] = []
         for i, c in enumerate(final.get("comments", [])):
             try:
@@ -1629,6 +1681,11 @@ class ReviewPipeline:
             },
             validator_notes=final.get("validator_notes"),
             plan_summary=plan_summary,
+            copyedit_items=[
+                CopyeditItem.model_validate(it)
+                for it in (copyedit_items or [])
+                if isinstance(it, dict)
+            ],
         )
         # persist report + exports into the run dir
         rdir = _runs_dir() / self.run_id

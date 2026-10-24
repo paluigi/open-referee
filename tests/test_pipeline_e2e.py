@@ -165,6 +165,27 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
     strong.queue(overall_json())
     strong.queue(json.dumps({"overall_feedback": "## Synth"}))  # synthesis
     strong.queue(validator_json())
+    # copyedit annex: intercepted by prompt (the defense queue above is
+    # over-provisioned, so FIFO position is not reliable here)
+    _orig_small_once = small._complete_once
+
+    async def _copyedit_aware(messages, *, json_mode):
+        if any("meticulous copyeditor" in m.content for m in messages):
+            from open_referee.providers.base import LLMResponse, Usage
+
+            return LLMResponse(
+                text=json.dumps({"items": [
+                    {"quote": "Widget networks are everywhere",
+                     "suggestion": "Widget networks are present everywhere",
+                     "kind": "phrasing"},
+                    {"quote": "This quote is not in the manuscript.",
+                     "suggestion": "x", "kind": "typo"},
+                ]}),
+                usage=Usage(input_tokens=100, output_tokens=50),
+            )
+        return await _orig_small_once(messages, json_mode=json_mode)
+
+    small._complete_once = _copyedit_aware
 
     events: list = []
     q = pipeline.subscribe()
@@ -193,6 +214,13 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
     assert report.validator_notes  # validator pass contributed notes
     assert report.model_roles["strong"] == "fake/strong-fake"
     assert report.usage.total_input_tokens > 0
+
+    # copyedit annex: locatable item kept, hallucinated quote dropped
+    assert len(report.copyedit_items) == 1
+    assert report.copyedit_items[0].kind == "phrasing"
+    md_e2e = (runs_dir / "e2e01" / "report.md").read_text()
+    assert "## Suggested language fixes (1)" in md_e2e
+    assert "This quote is not in the manuscript" not in md_e2e
 
     # persistence assertions
     assert (runs_dir / "e2e01" / "report.json").exists()

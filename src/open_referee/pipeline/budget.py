@@ -130,6 +130,7 @@ class PlanKnobs(BaseModel):
     claim_routing: str = "base"  # base | strong (numerical->strong) | all_strong
     output_budget: str = "default"  # low | default | high per-call-type budgets
     synthesis: bool = True  # lead-referee essay pass over deduplicated comments
+    copyedit: bool = True  # language-mechanics annex (verbatim fixes)
     defense_second_round: bool = False  # second defense pass on upheld comments
 
     @classmethod
@@ -145,6 +146,7 @@ class PlanKnobs(BaseModel):
             claim_routing=getattr(preset, "claim_routing", "base"),
             output_budget=getattr(preset, "output_budget", "default"),
             synthesis=getattr(preset, "synthesis", True),
+            copyedit=getattr(preset, "copyedit", True),
             defense_second_round=getattr(preset, "defense_second_round", False),
         )
 
@@ -163,6 +165,7 @@ OUTPUT_BUDGETS: dict[str, dict[str, int]] = {
         "whole_paper_challenge": 8192,
         "meta": 4096,
         "synthesis": 4096,
+        "copyedit": 4096,
         "validate": 4096,
     },
     "default": {
@@ -176,6 +179,7 @@ OUTPUT_BUDGETS: dict[str, dict[str, int]] = {
         "section_challenger": 4096,
         "meta": 6144,
         "synthesis": 6144,
+        "copyedit": 6144,
         "validate": 6144,
     },
     "high": {
@@ -189,6 +193,7 @@ OUTPUT_BUDGETS: dict[str, dict[str, int]] = {
         "section_challenger": 6144,
         "meta": 8192,
         "synthesis": 8192,
+        "copyedit": 8192,
         "validate": 8192,
     },
 }
@@ -398,6 +403,8 @@ class BudgetHarness:
                 return ("strong", 8000, 1500)
             case "synthesis":
                 return ("strong", 18_000, 6000)
+            case "copyedit":
+                return ("small", m + 800, 5000)
             case "dm_call":
                 return ("decision", 5000, 1)
         return ("small", 4000, 1500)
@@ -458,6 +465,7 @@ class BudgetHarness:
             "recompute_verify": 3 if knobs.recompute else 0,
             "meta": 1,
             "synthesis": 1 if knobs.synthesis else 0,
+            "copyedit": 1 if knobs.copyedit else 0,
             "validate": 1,
         }
         return {ct: n for ct, n in counts.items() if n > 0}
@@ -492,6 +500,7 @@ class BudgetHarness:
             max_artifacts=0,
             recompute=False,
             synthesis=False,  # starved runs keep the meta merger's own overall
+            copyedit=False,
         )
 
     def _cost_of(self, knobs: PlanKnobs) -> float:

@@ -51,6 +51,7 @@ STAGE_OF_CALL_TYPE: dict[str, str] = {
     "meta": "meta",
     "synthesis": "meta",
     "validate": "validate",
+    "copyedit": "copyedit",
     "fit_assessment": "fit",
 }
 
@@ -70,6 +71,7 @@ CANONICAL_STAGES = (
     "bibliography",
     "meta",
     "validate",
+    "copyedit",
     "assemble",
     "plan",
     "fit",

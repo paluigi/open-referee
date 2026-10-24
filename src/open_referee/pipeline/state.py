@@ -27,6 +27,7 @@ class Stage(str, Enum):
     BIBLIOGRAPHY = "bibliography"
     META = "meta"
     VALIDATE = "validate"
+    COPYEDIT = "copyedit"  # language-mechanics annex pass (post-validation)
     ASSEMBLE = "assemble"
     PLAN = "plan"  # pseudo-stage: budget planning / adjustment events
     FIT = "fit"  # desk-reject fit assessment product

@@ -55,6 +55,15 @@ class PlanSummary(BaseModel):
     notes: str | None = None  # e.g. gate stops ("claim verification stopped at 18/40")
 
 
+class CopyeditItem(BaseModel):
+    """One verbatim language-mechanics fix from the copyedit annex."""
+
+    quote: str  # exact span from the manuscript (mechanically located)
+    suggestion: str  # the corrected / reworked phrase
+    kind: str  # typo | grammar | phrasing | terminology
+    section: str | None = None
+
+
 class ReviewReport(BaseModel):
     run_id: str
     paper_title: str
@@ -66,6 +75,7 @@ class ReviewReport(BaseModel):
     model_roles: dict[str, str] = Field(default_factory=dict)  # role -> provider/model
     validator_notes: str | None = None  # notes from the post-meta validation pass
     plan_summary: PlanSummary | None = None  # budget-mode telemetry
+    copyedit_items: list[CopyeditItem] = Field(default_factory=list)  # language annex
     attribution: Attribution = Field(default_factory=Attribution)
 
     def sorted_comments(self) -> list[ReviewComment]:
