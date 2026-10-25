@@ -221,6 +221,22 @@ async def test_recompute_confirms_real_mismatch():
     assert pool.calls == ["recompute_extract", "recompute_verify"]
 
 
+def test_recompute_excerpt_keeps_prose_formulas_alongside_tables():
+    """Regression (seeded-eval S5): numeric paragraphs were excerpted only
+    when NO equation/table/caption blocks existed — any paper with a table
+    silently lost its prose-embedded formulas from recomputation."""
+    from open_referee.pipeline.recompute import _excerpt
+
+    doc = _doc(
+        "# T\n\n## 2 Data\n\nThe statistic is u = sqrt(v/q) with v = 2.0 and "
+        "q = 8.0, so u = 0.9 in all tables. " + "filler " * 40
+        + "\n\n| A | B |\n|---:|---:|\n| 1.0 | 2.0 |\n\nTable 1: values."
+    )
+    excerpt = _excerpt(doc)
+    assert "sqrt(v/q)" in excerpt, "prose formula dropped from the excerpt"
+    assert "u = 0.9" in excerpt
+
+
 @pytest.mark.asyncio
 async def test_recompute_consistent_value_needs_no_verification():
     from open_referee.pipeline.recompute import run_recompute

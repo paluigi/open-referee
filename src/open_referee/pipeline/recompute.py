@@ -154,25 +154,31 @@ async def _verify_mismatch(
 
 
 def _excerpt(doc: Document) -> str:
-    """Equations, tables and the most numeric paragraphs, bounded."""
+    """Equations, numeric prose paragraphs, tables, and decimal captions,
+    bounded.
+
+    Prose-stated formulas ("u = sqrt(v/q) with v = 2.0 ... so u = 0.9") are
+    included whenever tables/captions exist — previously they were a
+    fallback only, so any paper with a table silently lost its
+    prose-embedded formulas from recomputation.
+    """
     parts: list[str] = []
     for b in doc.blocks:
         if b.type.value == "equation":
             parts.append(b.text)
-        elif b.type.value == "table" and len(b.text) < 3000:
+    parts += [
+        b.text
+        for b in doc.blocks
+        if b.type.value in ("paragraph", "abstract")
+        and len(_DECIMAL_RE.findall(b.text)) >= 3
+    ][:20]
+    for b in doc.blocks:
+        if b.type.value == "table" and len(b.text) < 3000:
             parts.append(b.text)
         elif b.type.value == "caption" and _DECIMAL_RE.search(b.text):
             parts.append(b.text)
     for t in doc.tables:
         if t.markdown:
             parts.append(f"[table {t.id}] {t.markdown[:2000]}")
-    if not parts:
-        numeric = [
-            b.text
-            for b in doc.blocks
-            if b.type.value in ("paragraph", "abstract")
-            and len(_DECIMAL_RE.findall(b.text)) >= 3
-        ]
-        parts = numeric[:20]
     excerpt = "\n\n".join(p for p in parts if p)[:MAX_EXCERPT_CHARS]
     return excerpt

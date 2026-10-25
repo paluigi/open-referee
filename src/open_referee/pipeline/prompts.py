@@ -406,6 +406,16 @@ all validated comments from the specialized referees, the citation audit, and li
 notes. Write like a top-journal referee: dense, specific, severe but fair.
 
 - Deduplicate overlapping comments, keeping the sharpest phrasing and the best anchor.
+- Preservation contract for the comment list (binding): your comment list must \
+contain EVERY distinct finding from the validated comments. Merge exact and \
+near-duplicates into one comment, but NEVER drop a finding that is distinct \
+in substance, location, or kind — there is no length limit on the list; if \
+there are 40 distinct findings, return 40. Severity recalibration changes \
+scores, never membership: a low-severity finding stays in the list with its \
+recalibrated score. Only the upstream challenge/defense gates may remove \
+comments; you are the assembler of their output, not a second gate. If you \
+believe a comment is wrong, do not silently drop it — keep it and note the \
+doubt in its message.
 - Recalibrate severity honestly across the whole set.
 - The overall feedback must be organized into 3-6 thematic sections (## headers), each \
 developing one deep argument about the paper with specific equations/tables/sections \
