@@ -310,3 +310,154 @@ async def test_chunked_claim_inventory_merges_ids(test_config, monkeypatch):
     assert out[1]["anchor"] == "claim text three"
     assert len(strong.calls) == 2  # two chunk calls
     await pool.close()
+
+
+# --------------------------------------------- decision-model defense gate --
+
+
+@pytest.mark.asyncio
+async def test_defense_round_dm_batches_with_passages(test_config, sample_doc):
+    """The DM adjudication batches comments (no silent [:60k] context
+    truncation) and carries the anchored manuscript passage next to each
+    defense, so verdicts are checkable against what the paper says."""
+    from open_referee.pipeline.claims import DM_BATCH_COMMENTS, _defense_round_dm
+    from open_referee.providers.decisions import DecisionAnswer, DecisionResult
+
+    dm_inputs: list[str] = []
+    dm_qcounts: list[int] = []
+    adjudication_users: list[str] = []
+
+    class FakeDMPool:
+        decider = object()  # presence routes defense_round to the DM path
+
+        async def decide(self, input, questions, call_type="dm_defense"):
+            assert call_type == "dm_defense"
+            dm_inputs.append(input)
+            dm_qcounts.append(len(questions))
+            batch_no = len(dm_inputs)
+            answers = []
+            for q in questions:
+                idx = int(q.name.split("_")[1])
+                if q.name.startswith("verdict_"):
+                    choice = "uphold"
+                    if batch_no == 1 and idx == 2:
+                        choice = "dismiss"
+                    elif batch_no == 1 and idx == 3:
+                        choice = "adjust"
+                    answers.append(
+                        DecisionAnswer(type="choice", name=q.name, choice=choice)
+                    )
+                else:  # severity_<i>
+                    answers.append(
+                        DecisionAnswer(
+                            type="score",
+                            name=q.name,
+                            probabilities=[{"label": "major", "probability": 0.9}],
+                        )
+                    )
+            return DecisionResult(answers=answers)
+
+        async def complete_json(self, role, system, user, call_type="other", **kw):
+            if call_type == "defense":
+                return {
+                    "defense": "this is standard practice",
+                    "defense_strength": "weak",
+                    "concession": "",
+                }
+            assert call_type == "adjudication", f"unexpected {call_type}"
+            adjudication_users.append(user)
+            return {
+                "comment": {
+                    "title": "Adjusted",
+                    "message": "reworked message",
+                    "score": 0.4,
+                    "category": "clarity",
+                }
+            }
+
+    pipeline = ReviewPipeline.__new__(ReviewPipeline)
+    pipeline.cfg = test_config
+
+    async def _emit(*a, **k):
+        return None
+
+    pipeline._emit = _emit
+
+    n = DM_BATCH_COMMENTS * 2 + 5  # 85 -> batches of 40/40/5
+    candidates = [
+        {
+            "title": f"comment {i}",
+            "paragraph_anchor": (
+                "Theorem 1. Every widget network is stable." if i == 1 else "zzz nowhere"
+            ),
+            "quote": f"quote {i}",
+            "message": f"message {i}",
+            "score": 0.5,
+            "category": "clarity",
+            "provenance": "claim_verify 2-of-2",
+        }
+        for i in range(1, n + 1)
+    ]
+    kept = await _defense_round_dm(pipeline, FakeDMPool(), sample_doc, candidates, test_config)
+
+    # three batches, every question count bounded, no input near the 60k cap
+    assert dm_qcounts == [DM_BATCH_COMMENTS * 2, DM_BATCH_COMMENTS * 2, 10]
+    assert all(len(x) < 60_001 for x in dm_inputs)
+    # every listing entry carries a passage line; #1's is the real anchor text
+    assert dm_inputs[0].count("passage:") == DM_BATCH_COMMENTS
+    assert "Every widget network is stable" in dm_inputs[0]
+    # dismissed batch-1 #2 gone, adjusted #3 rewritten, rest upheld
+    assert len(kept) == n - 1
+    assert all(c["title"] != "comment 2" for c in kept)
+    adjusted = next(c for c in kept if c["title"] == "Adjusted")
+    # adjust-merge keeps candidate keys the rewrite omitted -> provenance survives
+    assert adjusted["provenance"] == "claim_verify 2-of-2"
+    assert adjusted["quote"] == "quote 3"
+    assert len(adjudication_users) == 1 and "standard practice" in adjudication_users[0]
+    # severity recalibration applied (major -> 0.7)
+    first = next(c for c in kept if c["title"] == "comment 1")
+    assert first["score"] == pytest.approx(0.7)
+
+
+@pytest.mark.asyncio
+async def test_defense_round_dm_batch_failure_upholds_that_batch(test_config, sample_doc):
+    """A failed decide() call upholds only its own batch — the rest of the
+    gate still runs (previously one monolithic failure nulled the gate)."""
+    from open_referee.pipeline.claims import DM_BATCH_COMMENTS, _defense_round_dm
+    from open_referee.providers.base import LLMError
+    from open_referee.providers.decisions import DecisionAnswer, DecisionResult
+
+    dm_calls = 0
+
+    class FakeDMPool:
+        decider = object()
+
+        async def decide(self, input, questions, call_type="dm_defense"):
+            nonlocal dm_calls
+            dm_calls += 1
+            if dm_calls == 2:
+                raise LLMError("decision endpoint down")
+            answers = [
+                DecisionAnswer(type="choice", name=q.name, choice="uphold")
+                for q in questions
+            ]
+            return DecisionResult(answers=answers)
+
+        async def complete_json(self, role, system, user, call_type="other", **kw):
+            return {"defense": "d", "defense_strength": "weak", "concession": ""}
+
+    pipeline = ReviewPipeline.__new__(ReviewPipeline)
+    pipeline.cfg = test_config
+
+    async def _emit(*a, **k):
+        return None
+
+    pipeline._emit = _emit
+    candidates = [
+        {"title": f"c{i}", "paragraph_anchor": "zzz", "quote": f"q{i}",
+         "message": "m", "score": 0.5, "category": "clarity"}
+        for i in range(DM_BATCH_COMMENTS + 3)
+    ]
+    kept = await _defense_round_dm(pipeline, FakeDMPool(), sample_doc, candidates, test_config)
+    assert dm_calls == 2
+    assert len(kept) == len(candidates)  # batch 2 failed -> upheld, nothing lost

@@ -33,6 +33,11 @@ if TYPE_CHECKING:
 # ----------------------------------------------------------------- constants --
 
 CHARS_PER_TOKEN = 3  # matches RolePool's pre-call estimate convention
+
+# defense-gate decision calls: comments per decide() batch (each batch
+# carries message/defense/passage excerpts, ~1.3k chars per comment,
+# keeping the decision context under the 60k-char API cap)
+DM_BATCH_COMMENTS = 40
 MAX_MANUSCRIPT_CHARS = 120_000
 MAX_PLANNER_CALLS = 4  # 1 strategy call + up to 3 mid-run adjustments
 PLANNER_CONTINGENCY_CALLS = 2  # reserve carved out for adjustments
@@ -407,6 +412,10 @@ class BudgetHarness:
                 return ("small", m + 800, 5000)
             case "dm_call":
                 return ("decision", 5000, 1)
+            case "dm_defense":
+                # one decide() batch: DM_BATCH_COMMENTS comments with
+                # message/defense/passage excerpts (~52k chars)
+                return ("decision", DM_BATCH_COMMENTS * 1300 // CHARS_PER_TOKEN, 1)
         return ("small", 4000, 1500)
 
     def unit_cost(self, ct: str) -> float:
@@ -456,6 +465,12 @@ class BudgetHarness:
             "whole_paper_challenge": 1,
             "defense": (
                 (self._est_comments(knobs) * (2 if knobs.defense_second_round else 1))
+                if knobs.defense_round
+                else 0
+            ),
+            "dm_defense": (
+                math.ceil(self._est_comments(knobs) / DM_BATCH_COMMENTS)
+                * (2 if knobs.defense_second_round else 1)
                 if knobs.defense_round
                 else 0
             ),

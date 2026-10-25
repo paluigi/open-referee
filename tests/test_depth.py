@@ -250,3 +250,28 @@ def test_frontier_includes_depth_archetypes():
     assert "cross-check" in names and "rigor-max" in names
     cross = next(p for p in h.frontier(limit=20) if p.name == "cross-check")
     assert cross.knobs.verify_passes == 2 and cross.knobs.claim_routing == "strong"
+
+
+def test_dm_defense_batch_counts_scale_with_comments():
+    from open_referee.pipeline.budget import DM_BATCH_COMMENTS, DocumentStats
+    from test_budget import make_harness
+
+    stats = DocumentStats(chars=60_000, n_sections=6, n_claims=20, n_references=10)
+    h, _ = make_harness(budget=50.0, stats=stats)
+    # _est_comments = min(200, ceil(20*0.5) + 6*2) = 22 -> one batch
+    c_std = h._call_counts(PlanKnobs(defense_round=True))
+    assert c_std["dm_defense"] == 1
+    role, est_in, est_out = h._base_unit("dm_defense")
+    assert role == "decision" and est_in > 10_000 and est_out == 1
+    # deep second round doubles the batches; a comment flood needs more batches
+    c_deep = h._call_counts(
+        PlanKnobs(defense_round=True, defense_second_round=True)
+    )
+    assert c_deep["dm_defense"] == 2
+    h2, _ = make_harness(
+        budget=500.0, stats=DocumentStats(chars=200_000, n_sections=40, n_claims=150,
+                                         n_references=30)
+    )
+    c_big = h2._call_counts(PlanKnobs(defense_round=True, max_claims=150))
+    # _est_comments = min(200, ceil(150*0.5) + 80) = 155 -> ceil(155/40) = 4
+    assert c_big["dm_defense"] == 4 == -(-155 // DM_BATCH_COMMENTS)

@@ -17,6 +17,7 @@ import re
 from open_referee.config import Config, ModelRole
 from open_referee.ingestion import Document, build_definitions_pack
 from open_referee.pipeline import prompts_claims
+from open_referee.pipeline.budget import DM_BATCH_COMMENTS
 from open_referee.pipeline.orchestrator import RolePool, _norm
 from open_referee.pipeline.state import Stage, StageStatus
 from open_referee.providers.base import ChatMessage
@@ -546,76 +547,102 @@ async def _defense_defense_texts(
     return list(await asyncio.gather(*(one(c) for c in candidates)))
 
 
+def _dm_listing(cands: list[dict], defenses: list[str], passages: list[str]) -> str:
+    """Decision-context listing: comment + defense + the manuscript passage
+    the comment is anchored to. The passage is the evidence an adjudicator
+    needs to check a defense against what the paper actually says; without
+    it a glib defense wins by assertion."""
+    return "\n".join(
+        f"{i}. [{c.get('title', '')[:70]}] severity={c.get('score')} "
+        f"message={(c.get('message') or '')[:300]}\n"
+        f"   defense: {defenses[i - 1][:300]}\n"
+        f"   passage: {passages[i - 1][:500]}"
+        for i, c in enumerate(cands, 1)
+    )
+
+
 async def _defense_round_dm(
     pipeline, pool: RolePool, doc: Document, candidates: list[dict], cfg: Config
 ) -> list[dict]:
-    """Decision-model adjudication: batched verdicts + severity, one call."""
+    """Decision-model adjudication: batched verdicts + severity.
+
+    One decide() call per DM_BATCH_COMMENTS batch, each batch carrying the
+    comment, its defense, AND the anchored manuscript passage. Batching
+    replaced a single monolithic call whose [:60_000] slice silently left
+    most verdict questions with no context on large comment sets."""
     from open_referee.providers.decisions import ChoiceQuestion, ScoreQuestion
 
     defenses = await _defense_defense_texts(pipeline, pool, doc, candidates, cfg)
-    listing = "\n".join(
-        f"{i}. [{c.get('title', '')[:70]}] severity={c.get('score')} "
-        f"message={(c.get('message') or '')[:400]}\n   defense: {defenses[i - 1][:400]}"
-        for i, c in enumerate(candidates, 1)
-    )
-    n = len(candidates)
-    questions = []
-    for i in range(1, n + 1):
-        questions.append(
-            ChoiceQuestion(
-                name=f"verdict_{i}",
-                instructions=(
-                    f"Adjudicate comment {i} after reading its authors' defense. "
-                    "dismiss = the defense refutes it; adjust = partially right, "
-                    "severity or wording needs correction; uphold = it stands."
-                ),
-                choices=[{"value": v} for v in ("uphold", "adjust", "dismiss")],
-            )
-        )
-        questions.append(
-            ScoreQuestion(
-                name=f"severity_{i}",
-                instructions=f"Recalibrated severity for comment {i} (if it stands).",
-                levels=[
-                    {"label": "polish", "description": "0.1-0.34"},
-                    {"label": "minor", "description": "0.35-0.59"},
-                    {"label": "major", "description": "0.6-0.79"},
-                    {"label": "invalidating", "description": "0.8-1.0"},
-                ],
-            )
-        )
-    try:
-        dm = await pool.decide(
-            f"Manuscript: {doc.title}\n\nComments with defenses:\n\n{listing}"[:60_000],
-            questions,
-            call_type="dm_defense",
-        )
-    except Exception as e:
-        logger.warning("DM adjudication failed (%s); all comments upheld", e)
-        return list(candidates)
-
+    passages = [
+        _passage_for(doc, c.get("paragraph_anchor") or c.get("quote") or "")
+        or "(anchor not found in document)"
+        for c in candidates
+    ]
     sev_map = {"polish": 0.25, "minor": 0.45, "major": 0.7, "invalidating": 0.9}
     kept: list[dict] = []
-    to_adjust: list[tuple[int, dict]] = []
-    for i, c in enumerate(candidates, 1):
-        v = dm.answer(f"verdict_{i}")
-        verdict = v.choice if v and v.choice else "uphold"
-        if verdict == "dismiss":
+    to_adjust: list[tuple[int, dict]] = []  # (original candidate index, comment)
+    for lo in range(0, len(candidates), DM_BATCH_COMMENTS):
+        batch = candidates[lo : lo + DM_BATCH_COMMENTS]
+        b_defenses = defenses[lo : lo + DM_BATCH_COMMENTS]
+        b_passages = passages[lo : lo + DM_BATCH_COMMENTS]
+        questions = []
+        for i in range(1, len(batch) + 1):
+            questions.append(
+                ChoiceQuestion(
+                    name=f"verdict_{i}",
+                    instructions=(
+                        f"Adjudicate comment {i} after reading its authors' defense "
+                        "and the manuscript passage it is anchored to — check the "
+                        "defense's claims against the passage, not just its rhetoric. "
+                        "dismiss = the defense refutes it; adjust = partially right, "
+                        "severity or wording needs correction; uphold = it stands."
+                    ),
+                    choices=[{"value": v} for v in ("uphold", "adjust", "dismiss")],
+                )
+            )
+            questions.append(
+                ScoreQuestion(
+                    name=f"severity_{i}",
+                    instructions=f"Recalibrated severity for comment {i} (if it stands).",
+                    levels=[
+                        {"label": "polish", "description": "0.1-0.34"},
+                        {"label": "minor", "description": "0.35-0.59"},
+                        {"label": "major", "description": "0.6-0.79"},
+                        {"label": "invalidating", "description": "0.8-1.0"},
+                    ],
+                )
+            )
+        listing = _dm_listing(batch, b_defenses, b_passages)
+        try:
+            dm = await pool.decide(
+                f"Manuscript: {doc.title}\n\nComments with defenses and the "
+                f"manuscript passages they are anchored to:\n\n{listing}"[:60_000],
+                questions,
+                call_type="dm_defense",
+            )
+        except Exception as e:
+            logger.warning("DM adjudication failed (%s); batch upheld", e)
+            kept.extend(dict(c) for c in batch)
             continue
-        cc = dict(c)
-        sv = dm.answer(f"severity_{i}")
-        if sv is not None and sv.probabilities:
-            best = max(sv.probabilities, key=lambda d: d.get("probability", 0))
-            label = best.get("label")
-            if label in sev_map:
-                cc["score"] = sev_map[label]
-        if verdict == "adjust":
-            to_adjust.append((i, cc))
-        else:
-            kept.append(cc)
+        for i, c in enumerate(batch, 1):
+            v = dm.answer(f"verdict_{i}")
+            verdict = v.choice if v and v.choice else "uphold"
+            if verdict == "dismiss":
+                continue
+            cc = dict(c)
+            sv = dm.answer(f"severity_{i}")
+            if sv is not None and sv.probabilities:
+                best = max(sv.probabilities, key=lambda d: d.get("probability", 0))
+                label = best.get("label")
+                if label in sev_map:
+                    cc["score"] = sev_map[label]
+            if verdict == "adjust":
+                to_adjust.append((lo + i - 1, cc))
+            else:
+                kept.append(cc)
 
     # LLM rewrites only the adjusted comments (usually few)
-    for i, cc in to_adjust:
+    for idx, cc in to_adjust:
         try:
             rewrite = await pool.complete_json(
                 ModelRole.SMALL,
@@ -626,8 +653,8 @@ async def _defense_round_dm(
                     message=(cc.get("message") or "")[:1500],
                     score=cc.get("score"),
                     defense_strength="adjusted by decision model",
-                    defense=defenses[i - 1][:2000],
-                    passage=(_passage_for(doc, cc.get("paragraph_anchor") or "") or "")[:2500],
+                    defense=defenses[idx][:2000],
+                    passage=passages[idx][:2500],
                 ),
                 call_type="adjudication",
             )
