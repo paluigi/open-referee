@@ -65,7 +65,10 @@ def test_checker_findings_become_candidate_comments(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_meta_merges_checker_comments_and_replaces_overall(tmp_path, monkeypatch):
+async def test_meta_does_not_dissolve_checker_comments(tmp_path, monkeypatch):
+    """Deterministic findings bypass the merge: code-verified comments must
+    reach the report as themselves (provenance intact, Deterministic checks
+    section) instead of being dissolved into meta-merged prose."""
     pipeline = _pipeline_with_findings(tmp_path)
 
     class Knobs:
@@ -89,9 +92,51 @@ async def test_meta_merges_checker_comments_and_replaces_overall(tmp_path, monke
     call_types = [c for c, _ in pool.calls]
     assert call_types == ["meta", "synthesis"]
     meta_user = pool.calls[0][1]
-    assert "Conflicting values for mae" in meta_user  # checker comment merged in
+    assert "Conflicting values for mae" not in meta_user  # checker comments not in the merge
     assert "LLM finding" in meta_user
     assert draft["overall_feedback"] == "## Synth essay"
+
+
+@pytest.mark.asyncio
+async def test_assemble_appends_checker_comments_with_provenance(tmp_path):
+    """_assemble appends the deterministic findings after validation so they
+    survive to the report regardless of what the LLM gates did."""
+    pipeline = _pipeline_with_findings(tmp_path)
+    pipeline.run_id = "asm01"
+
+    class Pool:
+        harness = None
+
+        class ledger:
+            @staticmethod
+            def by_role():
+                return {}
+
+            @staticmethod
+            def total_cost():
+                return 0.0
+
+            @staticmethod
+            def total_tokens():
+                return (0, 0)
+
+        specs = {}
+
+    pipeline._pool = Pool()
+    doc = document_from_markdown("# T\n\nBody text.", source_format="md", title_hint="t")
+    final = {
+        "paper_summary": "s",
+        "overall_feedback": "## F",
+        "comments": [{"title": "LLM finding", "quote": "Body text.",
+                      "paragraph_anchor": "Body text.", "message": "m",
+                      "score": 0.5, "category": "clarity"}],
+    }
+    report = await ReviewPipeline._assemble(pipeline, final, doc)
+    titles = {c.title for c in report.comments}
+    assert "LLM finding" in titles
+    det = [c for c in report.comments if c.provenance == "deterministic"]
+    assert det, "checker findings missing from the assembled report"
+    assert all(c.quote for c in det)
 
 
 @pytest.mark.asyncio

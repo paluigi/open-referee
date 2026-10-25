@@ -28,7 +28,7 @@ flowchart TD
         CH1 --> CH2[challenge: whole-paper]
         CH2 --> DEF[defense gate ×1-2 rounds<br/>dm_defense verdicts + LLM rewrites]
         DEF --> BIB[bibliography<br/>+ deterministic DOI loop]
-        BIB --> META[meta merge<br/>+ checker findings]
+        BIB --> META[meta merge<br/>LLM findings only]
         META --> SYN[synthesis: lead-referee essay]
         SYN --> VAL[dm_validate gate + validator]
     VAL --> CE[copyedit annex<br/>verbatim language fixes]
@@ -80,7 +80,7 @@ cost model's functions of document stats (chars C, sections S, claims N).
 | adjudication (rewrite) | challenge | small | rewrite 'adjust' comments only | ~2.8k / ~0.9k | adjusted |
 | doi loop | bibliography | — | per-reference Crossref (polite pool) + OpenAlex resolution ($0) | 0 | refs |
 | bibliography | bibliography | small | citation existence + quotation audit over resolution ground truth | ~22k / ~3k | refs |
-| meta | meta | strong | dedupe (never drops distinct findings), severity, merge checker findings | ~34k / ~4k | comments |
+| meta | meta | strong | dedupe (never drops distinct findings), severity — LLM findings only; checker findings bypass the gates to the report | ~34k / ~4k | comments |
 | synthesis | meta | strong | lead-referee essay: 4-6 argued themes over deduped comments | ~18k / ~6k | comments |
 | dm_validate | validate | decision | grounded-quote predicate per comment (60-question batches) | comments/3 / 1 | comments |
 | validate | validate | strong | final gate over survivors | C/3+27k / ~4k | C |

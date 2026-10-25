@@ -1450,7 +1450,11 @@ class ReviewPipeline:
             "entries": bib.get("entries", []),
             "in_text_issues": bib.get("in_text_issues", []),
         }
-        merged = list(validated) + self._checker_comments()
+        # deterministic checker findings do NOT enter the merge: they are
+        # code-verified and already distinct — meta's dedup dissolved them
+        # (RMI: 20 doi + 8 xref findings merged into one prose comment).
+        # They are appended after validation, provenance intact.
+        merged = list(validated)
         n_comments = len(merged)
         # the preservation contract keeps every distinct finding, so both the
         # input listing and the re-emitted output scale with comment count —
@@ -1653,12 +1657,17 @@ class ReviewPipeline:
         return out
 
     async def _assemble(self, final: dict, doc: Document, copyedit_items=None) -> ReviewReport:
-        final_comments = [c for c in final.get("comments", []) if isinstance(c, dict)]
+        # deterministic checker findings bypass the LLM gates entirely:
+        # code-verified, already distinct, provenance kept — they render in
+        # the report's Deterministic checks section rather than being
+        # dissolved into meta-merged prose
+        final_comments = list(self._checker_comments()) + [
+            c for c in final.get("comments", []) if isinstance(c, dict)
+        ]
         # provenance lost to meta/validator re-emission: re-attach from the
-        # verify-stage candidates + deterministic checker findings
+        # verify-stage candidates
         _reattach_provenance(
-            final_comments,
-            list(self.state.artifacts.get("candidates") or []) + self._checker_comments(),
+            final_comments, list(self.state.artifacts.get("candidates") or [])
         )
         comments: list[ReviewComment] = []
         for i, c in enumerate(final_comments):
