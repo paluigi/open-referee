@@ -222,6 +222,12 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
     assert "## Suggested language fixes (1)" in md_e2e
     assert "This quote is not in the manuscript" not in md_e2e
 
+    # provenance re-attachment: meta/validator rebuilds drop the field, the
+    # deterministic matcher restores it from the verify-stage candidates
+    prov = [c.provenance for c in report.comments if c.provenance]
+    assert "claim_verify 2-of-2" in prov
+    assert "[claim_verify 2-of-2]" in md_e2e
+
     # persistence assertions
     assert (runs_dir / "e2e01" / "report.json").exists()
     assert (runs_dir / "e2e01" / "report.md").exists()
@@ -541,3 +547,39 @@ async def test_resume_restores_spend_accounting(
     assert report2.usage.estimated_cost_usd == pytest.approx(spent1)
     assert report2.plan_summary is not None
     assert report2.plan_summary.mode == "auto"
+
+
+def test_reattach_provenance_matching_tiers():
+    """Exact normalized quote wins, anchor match second, title+message
+    similarity third; existing provenance is never overwritten; unmatched
+    comments stay untagged."""
+    from open_referee.pipeline.orchestrator import _reattach_provenance
+
+    sources = [
+        {"title": "Bad total", "quote": "the total is 480 items",
+         "paragraph_anchor": "Table 1 shows counts.", "provenance": "deterministic"},
+        {"title": "Unproven theorem", "quote": "every widget is stable",
+         "paragraph_anchor": "Theorem 1 states stability.",
+         "provenance": "claim_verify 2-of-2"},
+        {"title": "Sign error in Lemma 2", "quote": "", "paragraph_anchor": "",
+         "message": "The inequality direction flips under the stated assumptions.",
+         "provenance": "claim_verify 1-of-2 + arbitrated"},
+    ]
+    final = [
+        # exact quote match (whitespace drift tolerated by _norm)
+        {"title": "reworded", "quote": "The  total is 480 items"},
+        # anchor match
+        {"title": "reworded 2", "quote": "", "paragraph_anchor": "Theorem 1 states stability."},
+        # only similarity can find this one (message nearly identical)
+        {"title": "Sign error in Lemma 2 (adjusted)", "quote": "", "paragraph_anchor": "",
+         "message": "The inequality direction flips under the stated assumptions here."},
+        # nothing matches, and one that already has provenance
+        {"title": "orphan"},
+        {"title": "keep me", "quote": "x", "provenance": "already-there"},
+    ]
+    _reattach_provenance(final, sources)
+    assert final[0]["provenance"] == "deterministic"
+    assert final[1]["provenance"] == "claim_verify 2-of-2"
+    assert final[2]["provenance"] == "claim_verify 1-of-2 + arbitrated"
+    assert "provenance" not in final[3]
+    assert final[4]["provenance"] == "already-there"

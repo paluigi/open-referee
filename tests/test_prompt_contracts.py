@@ -43,3 +43,14 @@ def test_figure_text_instruction_instantiates_cleanly():
     instantiated = prompts_claims.claim_verify_system("figure_text")
     assert "FIGURE_TEXT VERIFICATION WORKER" in instantiated
     assert "PAIR of descriptions" in instantiated
+
+
+def test_validator_prompt_has_evidence_based_drop_contract():
+    sys = prompts.VALIDATOR_SYSTEM
+    assert "DROP rules" in sys and "ONLY when you can cite" in sys
+    for phrase in ("does not appear in the manuscript", "contradicts the criticism",
+                   "exact duplicate"):
+        assert phrase in sys, f"drop ground missing: {phrase}"
+    # severity taste must never remove; drops must be accountable
+    assert "recalibrated, never removed" in sys
+    assert "List every dropped title" in sys

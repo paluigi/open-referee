@@ -282,7 +282,9 @@ whole-paper referee.
 FIRST — validate each candidate as a skeptical referee would:
 - drop comments whose quote does not appear in the manuscript, whose \
 comparison misreads either passage, or that duplicate single-section issues;
-- adjust severity per the rubric; repair sloppy anchors with exact quotes.
+- adjust severity per the rubric; repair sloppy anchors with exact quotes;
+- on kept comments, echo any "provenance" and "claim_id" fields from the \
+candidate verbatim.
 
 SECOND — hunt for missed GLOBAL weaknesses, prioritizing:
 - overclaiming: the gap between what the abstract/intro/conclusion promise \
@@ -321,7 +323,8 @@ FIRST — validate each candidate as a skeptical referee would:
 - drop comments whose quote does not appear in the section, whose criticism is factually \
 wrong, or that are generic/style nits dressed up as substance;
 - adjust severity per the rubric (inflate nothing; 0.8+ only for result-invalidating flaws);
-- repair anchors: if the anchor is sloppy but the point is real, keep it with the exact quote.
+- repair anchors: if the anchor is sloppy but the point is real, keep it with the exact quote;
+- on kept comments, echo any "provenance" and "claim_id" fields from the candidate verbatim.
 
 SECOND — hunt for what the verifiers MISSED, prioritizing:
 - alternative explanations for the headline results that the paper never rules out;
@@ -452,10 +455,18 @@ from the manuscript itself;
 (3) the suggested fix is actionable and does not demand something the paper already does;
 (4) severity follows the rubric (0.8+ only for result-invalidating flaws);
 (5) tone: professional, about the work, never about the authors.
-DROP any comment you cannot substantiate — a fabricated criticism is worse than a missed \
-one. Merge near-duplicates the meta-reviewer left. Check the overall report: every claim \
-it makes must be supported by the retained comments or the manuscript; fix contradictions \
-between the report's recommendation and the comments' severity distribution.
+DROP rules (evidence-based — these are the ONLY grounds for removal): drop a comment \
+ONLY when you can cite (a) its quote does not appear in the manuscript (repair minor \
+drift before dropping); (b) the quoted text actually contradicts the criticism \
+(misreading); or (c) it is an exact duplicate of another kept comment. Everything \
+else stays: severity that feels too weak is recalibrated, never removed, and your \
+disagreement with a finding is not grounds for removal — the specialized verifiers \
+and the defense gate already adjudicated it. List every dropped title with its reason \
+(a/b/c) in validator_notes. A fabricated criticism is worse than a missed one, but a \
+silently dismissed true finding is worse still — when in doubt, keep the comment and \
+note the doubt. Merge near-duplicates the meta-reviewer left. Check the overall report: \
+every claim it makes must be supported by the retained comments or the manuscript; fix \
+contradictions between the report's recommendation and the comments' severity distribution.
 
 Return STRICT JSON: {"comments": [<final validated comment list, same fields>], \
 "overall_feedback": "<final markdown, corrected if needed>", "paper_summary": "<final>", \

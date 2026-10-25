@@ -197,3 +197,46 @@ async def test_second_defense_round_runs_on_survivors(monkeypatch):
     out = await defense_round(pipeline, Pool(), None, [{"t": 1}, {"t": 2}, {"t": 3}], None)
     assert calls == [[{"t": 1}, {"t": 2}, {"t": 3}], [{"t": 2}, {"t": 3}]]
     assert out == [{"t": 3}]
+
+
+@pytest.mark.asyncio
+async def test_dm_validator_gate_receives_manuscript_text():
+    """The grounded-quote predicate is only checkable if the manuscript text
+    rides along — previously the decision input carried the paper title and
+    the comment listing, nothing else."""
+    pipeline = ReviewPipeline.__new__(ReviewPipeline)
+
+    async def emit(*a, **k):
+        return None
+
+    pipeline._emit = emit  # type: ignore[method-assign]
+    doc = document_from_markdown(
+        "# T\n\nThe sentinel sentence about widgets appears in this paper.",
+        source_format="md",
+        title_hint="t",
+    )
+    inputs: list[str] = []
+
+    class Decider:
+        async def decide(self, input, questions, call_type="dm"):
+            inputs.append(input)
+            from open_referee.providers.decisions import DecisionAnswer, DecisionResult
+
+            return DecisionResult(
+                answers=[
+                    DecisionAnswer(type="predicate", name=q.name, probability=0.9)
+                    for q in questions
+                ]
+            )
+
+    class Pool:
+        decider = object()
+
+    Pool.decide = Decider().decide
+    pool = Pool()
+
+    comments = [{"title": "c", "quote": "sentinel sentence", "paragraph_anchor": "a"}]
+    kept = await ReviewPipeline._dm_validator_gate(pipeline, pool, doc, comments)
+    assert len(kept) == 1
+    assert "The sentinel sentence about widgets appears in this paper." in inputs[0]
+    assert "Manuscript text" in inputs[0]

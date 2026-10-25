@@ -1451,18 +1451,33 @@ class ReviewPipeline:
             "in_text_issues": bib.get("in_text_issues", []),
         }
         merged = list(validated) + self._checker_comments()
+        n_comments = len(merged)
+        # the preservation contract keeps every distinct finding, so both the
+        # input listing and the re-emitted output scale with comment count —
+        # static caps truncated large merges mid-JSON (RMI: 238 comments)
+        from open_referee.pipeline.budget import call_max_tokens
+
+        out_level = str(getattr(self.plan_knobs(), "output_budget", "default"))
+        meta_max = max(
+            call_max_tokens("meta", out_level) or 8192,
+            min(32_768, 2_000 + 130 * n_comments),
+        )
         user = (
             prompts.META_USER.format(
                 title=doc.title,
                 triage_json=json.dumps(triage)[:4000],
-                comments_json=json.dumps(merged, indent=1)[:100_000],
+                comments_json=json.dumps(merged, indent=1)[: max(100_000, 900 * n_comments)],
                 bib_summary=json.dumps(bib_summary)[:8000],
                 sota_notes=(pack.field_hint or "")[:1500],
             )
             + self._venue_block
         )
         draft = await pool.complete_json(
-            ModelRole.STRONG, prompts.META_SYSTEM, user, call_type="meta"
+            ModelRole.STRONG,
+            prompts.META_SYSTEM,
+            user,
+            call_type="meta",
+            max_tokens=meta_max,
         )
         # synthesis: the lead-referee essay over the deduplicated comments,
         # replacing the merger's overall feedback with argued prose
@@ -1537,14 +1552,17 @@ class ReviewPipeline:
                     name=f"comment_{i}",
                     instructions=(
                         f"Review comment {i} quotes or paraphrases text that actually "
-                        "appears in the manuscript (not invented)."
+                        "appears in the manuscript text provided above (not invented) — "
+                        "check the quote/anchor against that text."
                     ),
                 )
                 for i in range(1, len(chunk) + 1)
             ]
             try:
                 dm = await pool.decide(
-                    f"Manuscript: {doc.title}\n\nComments:\n{listing}", qs,
+                    f"Manuscript: {doc.title}\n\nManuscript text:\n---\n"
+                    f"{self._manuscript_trunc(doc)}\n---\n\nComments:\n{listing}",
+                    qs,
                     call_type="dm_validate",
                 )
             except LLMError as e:
@@ -1635,8 +1653,15 @@ class ReviewPipeline:
         return out
 
     async def _assemble(self, final: dict, doc: Document, copyedit_items=None) -> ReviewReport:
+        final_comments = [c for c in final.get("comments", []) if isinstance(c, dict)]
+        # provenance lost to meta/validator re-emission: re-attach from the
+        # verify-stage candidates + deterministic checker findings
+        _reattach_provenance(
+            final_comments,
+            list(self.state.artifacts.get("candidates") or []) + self._checker_comments(),
+        )
         comments: list[ReviewComment] = []
-        for i, c in enumerate(final.get("comments", [])):
+        for i, c in enumerate(final_comments):
             try:
                 score = max(0.0, min(1.0, float(c.get("score", 0.3))))
             except (TypeError, ValueError):
@@ -1656,7 +1681,7 @@ class ReviewPipeline:
                     score=score,
                     category=c.get("category") or "general",
                     anchor_confidence=confidence,
-                    provenance=(c.get("provenance") or None) if isinstance(c, dict) else None,
+                    provenance=c.get("provenance") or None,
                 )
             )
         u = self._pool.ledger if self._pool else None
@@ -1778,6 +1803,47 @@ def _norm(t: str) -> str:
 
 def _anchor_in(anchor: str, text: str) -> bool:
     return _norm(anchor)[:120] in _norm(text)
+
+
+def _reattach_provenance(final_comments: list[dict], sources: list[dict]) -> None:
+    """Deterministically re-attach provenance that model re-emissions dropped.
+
+    The meta merger and the validator rebuild every comment dict per the
+    JSON comment schema, which has no provenance field — so multi-pass
+    badges ("claim_verify 2-of-2") and the deterministic/recompute tags
+    never reached the report. Matching is mechanical: exact normalized
+    quote/anchor keys first, then the difflib title+message similarity the
+    claim engine already uses. Only fills gaps; never overwrites."""
+    indexed = [
+        s for s in sources if isinstance(s, dict) and s.get("provenance")
+    ]
+    if not indexed:
+        return
+    from open_referee.pipeline.claims import _similar_comments
+
+    by_quote: dict[str, str] = {}
+    by_anchor: dict[str, str] = {}
+    for s in indexed:
+        q = _norm(s.get("quote") or "")[:120]
+        a = _norm(s.get("paragraph_anchor") or "")[:120]
+        if q:
+            by_quote.setdefault(q, str(s["provenance"]))
+        if a:
+            by_anchor.setdefault(a, str(s["provenance"]))
+    for c in final_comments:
+        if not isinstance(c, dict) or c.get("provenance"):
+            continue
+        q = _norm(c.get("quote") or "")[:120]
+        a = _norm(c.get("paragraph_anchor") or "")[:120]
+        if q and q in by_quote:
+            c["provenance"] = by_quote[q]
+        elif a and a in by_anchor:
+            c["provenance"] = by_anchor[a]
+        else:
+            for s in indexed:
+                if _similar_comments(c, s):
+                    c["provenance"] = str(s["provenance"])
+                    break
 
 
 def _resolve_anchor(doc: Document, anchor: str, quote: str) -> tuple[str | None, float]:
