@@ -447,9 +447,7 @@ class BudgetHarness:
             "surveyor": 1,
             "planner": 1 + PLANNER_CONTINGENCY_CALLS if self.auto else 0,
             "claim_verify": claims * max(1, knobs.verify_passes),
-            "claim_arbitrate": (
-                math.ceil(claims * 0.15) if knobs.verify_passes > 1 else 0
-            ),
+            "claim_arbitrate": (math.ceil(claims * 0.15) if knobs.verify_passes > 1 else 0),
             "lens_section": (
                 self.stats.n_sections * max(1, self.stats.n_lenses)
                 if knobs.per_section_lenses

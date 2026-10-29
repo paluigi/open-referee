@@ -26,9 +26,7 @@ async def test_openalex_mailto_and_api_key_in_every_request(monkeypatch):
     monkeypatch.setenv("EMAIL", "researcher@uni.edu")
     client = OpenAlexClient(OpenAlexConfig())
     transport = _Recorder()
-    client._http = httpx.AsyncClient(
-        base_url="https://api.openalex.org", transport=transport
-    )
+    client._http = httpx.AsyncClient(base_url="https://api.openalex.org", transport=transport)
     async with client:
         await client._search_rest("widgets", 5)
         await client.get_work_by_doi("10.1000/fake")

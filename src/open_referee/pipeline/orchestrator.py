@@ -128,7 +128,11 @@ class RolePool:
         return result
 
     async def complete_json(
-        self, role: ModelRole, system: str, user: str, call_type: str = "other",
+        self,
+        role: ModelRole,
+        system: str,
+        user: str,
+        call_type: str = "other",
         max_tokens: int | None = None,
     ) -> dict:
         """JSON-mode completion with parse-repair retry, ledger check, usage record.
@@ -183,9 +187,7 @@ class RolePool:
             ChatMessage(role="system", content=system),
             ChatMessage(role="user", content=user),
         ]
-        p1_budget = max(
-            int(getattr(self.cfg.llm, "json_phase_max_tokens", 16384)), spec.max_tokens
-        )
+        p1_budget = max(int(getattr(self.cfg.llm, "json_phase_max_tokens", 16384)), spec.max_tokens)
         saved = provider.spec
         try:
             provider.spec = spec.model_copy(update={"call_max_tokens": p1_budget})
@@ -203,8 +205,7 @@ class RolePool:
 
         emission_effort = str(getattr(self.cfg.llm, "json_phase_reasoning_effort", "low"))
         emit_system = (
-            system
-            + "\n\nYou are given your own prior analysis of the task. Output ONLY "
+            system + "\n\nYou are given your own prior analysis of the task. Output ONLY "
             "the required JSON object now — no prose, no code fences, no reasoning."
         )
         emit_user = (
@@ -228,7 +229,13 @@ class RolePool:
         return extract_json(resp2.text)
 
     async def _complete_json_inner(
-        self, provider, spec, role: ModelRole, system: str, user: str, call_type: str,
+        self,
+        provider,
+        spec,
+        role: ModelRole,
+        system: str,
+        user: str,
+        call_type: str,
         eff_mt: int | None = None,
     ) -> dict:
         est_in = (len(system) + len(user)) // 3
@@ -259,16 +266,12 @@ class RolePool:
             # cheap escalation first: same call under the low-effort control
             # (survey + live probes: reasoning spiral short-circuits, valid
             # JSON in seconds) before the expensive free-form phase
-            emission_effort = str(
-                getattr(self.cfg.llm, "json_phase_reasoning_effort", "low")
-            )
+            emission_effort = str(getattr(self.cfg.llm, "json_phase_reasoning_effort", "low"))
             saved_spec = provider.spec
             try:
                 provider.spec = spec.model_copy(update={"reasoning_effort": emission_effort})
                 resp_low = await provider.complete(messages, json_mode=True)
-                rec_low = await self.ledger.record(
-                    spec, role.value, resp_low, call_type=call_type
-                )
+                rec_low = await self.ledger.record(spec, role.value, resp_low, call_type=call_type)
                 if self.harness is not None:
                     self.harness.note_record(rec_low)
             finally:
@@ -951,7 +954,10 @@ class ReviewPipeline:
         from open_referee.pipeline.claims import run_claim_inventory
 
         claims = await run_claim_inventory(
-            pool, doc, triage, self.cfg,
+            pool,
+            doc,
+            triage,
+            self.cfg,
             output_budget=str(getattr(self.plan_knobs(), "output_budget", "default")),
         )
         await self._emit(Stage.CLAIMS, StageStatus.RUNNING, f"{len(claims)} claims catalogued")
@@ -1619,9 +1625,7 @@ class ReviewPipeline:
         if not self.budget_allows("copyedit"):
             self._note_gate_stop("copyedit")
             return []
-        user = prompts.COPYEDIT_USER.format(
-            title=doc.title, manuscript=self._manuscript_trunc(doc)
-        )
+        user = prompts.COPYEDIT_USER.format(title=doc.title, manuscript=self._manuscript_trunc(doc))
         try:
             res = await pool.complete_json(
                 ModelRole.SMALL, prompts.COPYEDIT_SYSTEM, user, call_type="copyedit"
@@ -1637,8 +1641,10 @@ class ReviewPipeline:
             quote = str(it.get("quote", "")).strip()
             suggestion = str(it.get("suggestion", "")).strip()
             kind = str(it.get("kind", "phrasing")).strip().lower()
-            if not quote or not suggestion or kind not in (
-                "typo", "grammar", "phrasing", "terminology"
+            if (
+                not quote
+                or not suggestion
+                or kind not in ("typo", "grammar", "phrasing", "terminology")
             ):
                 continue
             block_id, _conf = _resolve_anchor(doc, quote, quote)
@@ -1666,9 +1672,7 @@ class ReviewPipeline:
         ]
         # provenance lost to meta/validator re-emission: re-attach from the
         # verify-stage candidates
-        _reattach_provenance(
-            final_comments, list(self.state.artifacts.get("candidates") or [])
-        )
+        _reattach_provenance(final_comments, list(self.state.artifacts.get("candidates") or []))
         comments: list[ReviewComment] = []
         for i, c in enumerate(final_comments):
             try:
@@ -1823,9 +1827,7 @@ def _reattach_provenance(final_comments: list[dict], sources: list[dict]) -> Non
     never reached the report. Matching is mechanical: exact normalized
     quote/anchor keys first, then the difflib title+message similarity the
     claim engine already uses. Only fills gaps; never overwrites."""
-    indexed = [
-        s for s in sources if isinstance(s, dict) and s.get("provenance")
-    ]
+    indexed = [s for s in sources if isinstance(s, dict) and s.get("provenance")]
     if not indexed:
         return
     from open_referee.pipeline.claims import _similar_comments

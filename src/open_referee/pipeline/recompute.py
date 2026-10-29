@@ -169,8 +169,7 @@ def _excerpt(doc: Document) -> str:
     parts += [
         b.text
         for b in doc.blocks
-        if b.type.value in ("paragraph", "abstract")
-        and len(_DECIMAL_RE.findall(b.text)) >= 3
+        if b.type.value in ("paragraph", "abstract") and len(_DECIMAL_RE.findall(b.text)) >= 3
     ][:20]
     for b in doc.blocks:
         if b.type.value == "table" and len(b.text) < 3000:

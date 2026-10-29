@@ -17,8 +17,12 @@ from open_referee.pipeline import prompts, prompts_claims
 def test_inventory_prompt_demands_coverage_families():
     sys = prompts_claims.CLAIM_INVENTORY_SYSTEM
     assert "Coverage duties" in sys
-    for phrase in ("Overclaims and hedge removals", "Significance statements",
-                   "Figure/table descriptions", "Table-prose comparisons"):
+    for phrase in (
+        "Overclaims and hedge removals",
+        "Significance statements",
+        "Figure/table descriptions",
+        "Table-prose comparisons",
+    ):
         assert phrase in sys, f"coverage family missing: {phrase}"
 
 
@@ -35,8 +39,10 @@ def test_meta_prompt_has_preservation_contract():
     assert "Preservation contract" in sys
     assert "NEVER drop a finding that is distinct" in sys
     # severity recalibration must not change list membership
-    assert "changes \\\nscores, never membership" in sys or \
-        "changes scores, never membership" in sys.replace("\\\n", "")
+    assert (
+        "changes \\\nscores, never membership" in sys
+        or "changes scores, never membership" in sys.replace("\\\n", "")
+    )
 
 
 def test_figure_text_instruction_instantiates_cleanly():
@@ -48,8 +54,11 @@ def test_figure_text_instruction_instantiates_cleanly():
 def test_validator_prompt_has_evidence_based_drop_contract():
     sys = prompts.VALIDATOR_SYSTEM
     assert "DROP rules" in sys and "ONLY when you can cite" in sys
-    for phrase in ("does not appear in the manuscript", "contradicts the criticism",
-                   "exact duplicate"):
+    for phrase in (
+        "does not appear in the manuscript",
+        "contradicts the criticism",
+        "exact duplicate",
+    ):
         assert phrase in sys, f"drop ground missing: {phrase}"
     # severity taste must never remove; drops must be accountable
     assert "recalibrated, never removed" in sys

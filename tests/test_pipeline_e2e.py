@@ -174,13 +174,22 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
             from open_referee.providers.base import LLMResponse, Usage
 
             return LLMResponse(
-                text=json.dumps({"items": [
-                    {"quote": "Widget networks are everywhere",
-                     "suggestion": "Widget networks are present everywhere",
-                     "kind": "phrasing"},
-                    {"quote": "This quote is not in the manuscript.",
-                     "suggestion": "x", "kind": "typo"},
-                ]}),
+                text=json.dumps(
+                    {
+                        "items": [
+                            {
+                                "quote": "Widget networks are everywhere",
+                                "suggestion": "Widget networks are present everywhere",
+                                "kind": "phrasing",
+                            },
+                            {
+                                "quote": "This quote is not in the manuscript.",
+                                "suggestion": "x",
+                                "kind": "typo",
+                            },
+                        ]
+                    }
+                ),
                 usage=Usage(input_tokens=100, output_tokens=50),
             )
         return await _orig_small_once(messages, json_mode=json_mode)
@@ -556,14 +565,25 @@ def test_reattach_provenance_matching_tiers():
     from open_referee.pipeline.orchestrator import _reattach_provenance
 
     sources = [
-        {"title": "Bad total", "quote": "the total is 480 items",
-         "paragraph_anchor": "Table 1 shows counts.", "provenance": "deterministic"},
-        {"title": "Unproven theorem", "quote": "every widget is stable",
-         "paragraph_anchor": "Theorem 1 states stability.",
-         "provenance": "claim_verify 2-of-2"},
-        {"title": "Sign error in Lemma 2", "quote": "", "paragraph_anchor": "",
-         "message": "The inequality direction flips under the stated assumptions.",
-         "provenance": "claim_verify 1-of-2 + arbitrated"},
+        {
+            "title": "Bad total",
+            "quote": "the total is 480 items",
+            "paragraph_anchor": "Table 1 shows counts.",
+            "provenance": "deterministic",
+        },
+        {
+            "title": "Unproven theorem",
+            "quote": "every widget is stable",
+            "paragraph_anchor": "Theorem 1 states stability.",
+            "provenance": "claim_verify 2-of-2",
+        },
+        {
+            "title": "Sign error in Lemma 2",
+            "quote": "",
+            "paragraph_anchor": "",
+            "message": "The inequality direction flips under the stated assumptions.",
+            "provenance": "claim_verify 1-of-2 + arbitrated",
+        },
     ]
     final = [
         # exact quote match (whitespace drift tolerated by _norm)
@@ -571,8 +591,12 @@ def test_reattach_provenance_matching_tiers():
         # anchor match
         {"title": "reworded 2", "quote": "", "paragraph_anchor": "Theorem 1 states stability."},
         # only similarity can find this one (message nearly identical)
-        {"title": "Sign error in Lemma 2 (adjusted)", "quote": "", "paragraph_anchor": "",
-         "message": "The inequality direction flips under the stated assumptions here."},
+        {
+            "title": "Sign error in Lemma 2 (adjusted)",
+            "quote": "",
+            "paragraph_anchor": "",
+            "message": "The inequality direction flips under the stated assumptions here.",
+        },
         # nothing matches, and one that already has provenance
         {"title": "orphan"},
         {"title": "keep me", "quote": "x", "provenance": "already-there"},

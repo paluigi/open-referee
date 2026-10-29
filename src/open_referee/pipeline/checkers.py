@@ -48,20 +48,29 @@ _LABEL_REF_RE = re.compile(
     re.I,
 )
 _EQ_DEF_RE = re.compile(r"(?:\\tag\{([0-9]+[a-z]?)\}|\(([0-9]+[a-z]?)\)\s*$)")
-_EQ_REF_RE = re.compile(
-    r"\b(?:equation|eq\.?s?|expression)\s*\(?([0-9]+[a-z]?)\)?", re.I
-)
+_EQ_REF_RE = re.compile(r"\b(?:equation|eq\.?s?|expression)\s*\(?([0-9]+[a-z]?)\)?", re.I)
 _SECTION_REF_RE = re.compile(r"\b(?:section|sect\.?)\s+([0-9]+(?:\.[0-9]+)*)\b", re.I)
 _NUM_MONOTONE_RE = re.compile(r"^[0-9]+")
 # a line anywhere in the text that looks like a numbered (sub)section heading
 _ANY_NUMBERED_LINE_RE = re.compile(r"^\s*\d{1,2}(?:\.\d{1,2}){0,2}[.:]?\s+[A-Z]\S.*$")
 
 _CLASS_CANON = {
-    "figure": "Figure", "fig.": "Figure", "table": "Table", "theorem": "Theorem",
-    "thm.": "Theorem", "lemma": "Lemma", "proposition": "Proposition",
-    "prop.": "Proposition", "corollary": "Corollary", "definition": "Definition",
-    "algorithm": "Algorithm", "appendix": "Appendix", "equation": "Equation",
-    "eq.": "Equation", "eqs.": "Equation", "expression": "Equation",
+    "figure": "Figure",
+    "fig.": "Figure",
+    "table": "Table",
+    "theorem": "Theorem",
+    "thm.": "Theorem",
+    "lemma": "Lemma",
+    "proposition": "Proposition",
+    "prop.": "Proposition",
+    "corollary": "Corollary",
+    "definition": "Definition",
+    "algorithm": "Algorithm",
+    "appendix": "Appendix",
+    "equation": "Equation",
+    "eq.": "Equation",
+    "eqs.": "Equation",
+    "expression": "Equation",
 }
 _SKIP_CLASS_FOR_REFS = {"Definition"}  # definitions are rarely referenced by number
 _MAX_XREF_FINDINGS = 8
@@ -149,11 +158,7 @@ def cross_reference_check(doc: Document) -> list[CheckFinding]:
             seen[label_id] = block_id
         if cls in duplicated_classes:
             continue
-        nums = [
-            int(m.group(0))
-            for m in (_NUM_MONOTONE_RE.match(lid) for lid, _ in items)
-            if m
-        ]
+        nums = [int(m.group(0)) for m in (_NUM_MONOTONE_RE.match(lid) for lid, _ in items) if m]
         if len(nums) >= 3 and nums != sorted(nums):
             findings.append(
                 CheckFinding(
@@ -231,8 +236,12 @@ def cross_reference_check(doc: Document) -> list[CheckFinding]:
                 section=slot["section"],
                 category="reference",
                 severity=0.35,
-                meta={"class": cls, "label": label_id, "kind": "dangling",
-                      "occurrences": slot["count"]},
+                meta={
+                    "class": cls,
+                    "label": label_id,
+                    "kind": "dangling",
+                    "occurrences": slot["count"],
+                },
             )
         )
     if missing_sections:
@@ -329,22 +338,84 @@ _UNIT_MENTION = ("%", "pp", "percentage points", "per cent")
 _DOI_TOKEN_RE = re.compile(r"^10\.\d{4,}")
 _LATEX_PREFIX_RE = re.compile(r"(\\[a-z]+|\barray\b|\bbegin\b|\bend\b|\bfrac\b|\\\$)")
 _GENERIC_TAIL = {
-    "estimate", "estimates", "value", "values", "number", "numbers",
-    "result", "results", "increase", "decrease", "level", "levels",
-    "rate", "rates", "size", "sizes", "sample", "samples",
-    "january", "february", "march", "april", "may", "june", "july",
-    "august", "september", "october", "november", "december",
+    "estimate",
+    "estimates",
+    "value",
+    "values",
+    "number",
+    "numbers",
+    "result",
+    "results",
+    "increase",
+    "decrease",
+    "level",
+    "levels",
+    "rate",
+    "rates",
+    "size",
+    "sizes",
+    "sample",
+    "samples",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
 }
 _CONNECTORS = {
-    "of", "is", "as", "was", "at", "in", "to", "and", "the", "a", "an",
-    "for", "with", "by", "on", "from", "are", "were", "has", "have",
-    "equals", "equal", "per", "about", "over", "under",
+    "of",
+    "is",
+    "as",
+    "was",
+    "at",
+    "in",
+    "to",
+    "and",
+    "the",
+    "a",
+    "an",
+    "for",
+    "with",
+    "by",
+    "on",
+    "from",
+    "are",
+    "were",
+    "has",
+    "have",
+    "equals",
+    "equal",
+    "per",
+    "about",
+    "over",
+    "under",
 }
 _PROSE_BLOCKS = ("paragraph", "abstract", "caption")
 _STRUCTURAL_TAIL = {
-    "section", "sections", "figure", "figures", "table", "tables",
-    "equation", "equations", "appendix", "page", "pages", "fig",
-    "chapter", "step", "steps", "period", "wave",
+    "section",
+    "sections",
+    "figure",
+    "figures",
+    "table",
+    "tables",
+    "equation",
+    "equations",
+    "appendix",
+    "page",
+    "pages",
+    "fig",
+    "chapter",
+    "step",
+    "steps",
+    "period",
+    "wave",
 }
 
 
@@ -360,7 +431,7 @@ def _consistent(a_tok: str, b_tok: str) -> bool:
     a, b = _value(a_tok), _value(b_tok)
     min_dec = min(_decimals(a_tok), _decimals(b_tok))
     if min_dec:
-        if abs(a - b) <= 0.6 * 10 ** -min_dec:
+        if abs(a - b) <= 0.6 * 10**-min_dec:
             return True
     return abs(a - b) <= max(1e-9, 0.01 * max(abs(a), abs(b)))
 
@@ -395,7 +466,8 @@ def number_consistency_check(doc: Document) -> list[CheckFinding]:
         inside = [
             om
             for om in head
-            if om is not hm and _same_quantity(hm["words"], om["words"])
+            if om is not hm
+            and _same_quantity(hm["words"], om["words"])
             and not _consistent(hm["tok"], om["tok"])
         ]
         conflicts = candidates + inside
@@ -405,8 +477,7 @@ def number_consistency_check(doc: Document) -> list[CheckFinding]:
         a, b = sorted([hm["tok"], other["tok"]])
         template = " ".join(hm["words"][-3:])
         dup = any(
-            f.meta.get("template") == template
-            and f.meta.get("values", [None, None])[:2] == [a, b]
+            f.meta.get("template") == template and f.meta.get("values", [None, None])[:2] == [a, b]
             for f in findings
         )
         if dup:
@@ -448,10 +519,7 @@ def _split_abstract(doc: Document) -> tuple[list, list]:
             rest.append(b)
             continue
         if b.type.value == "heading":
-            if (
-                not seen_heading
-                and b.text.strip().lower().rstrip(":.") in ("abstract", "summary")
-            ):
+            if not seen_heading and b.text.strip().lower().rstrip(":.") in ("abstract", "summary"):
                 continue  # abstract heading itself — what follows is still front matter
             seen_heading = True
             rest.append(b)
@@ -530,9 +598,7 @@ def _num(cell: str) -> float | None:
 def table_arithmetic_check(doc: Document) -> list[CheckFinding]:
     findings: list[CheckFinding] = []
     tables = [(t.id, t.caption, t.markdown) for t in doc.tables if t.markdown]
-    tables += [
-        (b.id, None, b.text) for b in doc.blocks if b.type.value == "table"
-    ]
+    tables += [(b.id, None, b.text) for b in doc.blocks if b.type.value == "table"]
     for tid, caption, md in tables:
         rows = _parse_md_table(md)
         if not rows:
@@ -546,9 +612,7 @@ def table_arithmetic_check(doc: Document) -> list[CheckFinding]:
                 total = _num(row[col])
                 if total is None:
                     continue
-                above = [
-                    _num(r[col]) for r in body[:i] if col < len(r)
-                ]
+                above = [_num(r[col]) for r in body[:i] if col < len(r)]
                 above = [v for v in above if v is not None]
                 if len(above) < 2:
                     continue
@@ -563,7 +627,7 @@ def table_arithmetic_check(doc: Document) -> list[CheckFinding]:
                     findings.append(
                         CheckFinding(
                             check="table-arithmetic",
-                            title=f'Total row does not sum: {label} ({tid})',
+                            title=f"Total row does not sum: {label} ({tid})",
                             message=(
                                 f'The "{row[0]}" row reports {total:g} for '
                                 f'"{label}", but the rows above sum to {s:g}. '
@@ -573,8 +637,7 @@ def table_arithmetic_check(doc: Document) -> list[CheckFinding]:
                             quote=_table_quote(md, row),
                             category="consistency",
                             severity=0.7,
-                            meta={"table": tid, "column": label,
-                                  "reported": total, "computed": s},
+                            meta={"table": tid, "column": label, "reported": total, "computed": s},
                         )
                     )
         # "total"-named column: each row's cell should equal the row's part sum
@@ -590,9 +653,9 @@ def table_arithmetic_check(doc: Document) -> list[CheckFinding]:
                 parts = [
                     _num(row[c])
                     for c in range(1, len(row))
-                    if c != col and c < len(row) and not re.search(
-                        r"\b(total|share|sum|%)\b", header[c], re.I
-                    )
+                    if c != col
+                    and c < len(row)
+                    and not re.search(r"\b(total|share|sum|%)\b", header[c], re.I)
                 ]
                 parts = [v for v in parts if v is not None]
                 if len(parts) < 2:
@@ -602,7 +665,7 @@ def table_arithmetic_check(doc: Document) -> list[CheckFinding]:
                     findings.append(
                         CheckFinding(
                             check="table-arithmetic",
-                            title=f'Row total mismatch in {tid}: {row[0]}',
+                            title=f"Row total mismatch in {tid}: {row[0]}",
                             message=(
                                 f'Row "{row[0]}": the "{h}" column reports '
                                 f"{total:g} but the row's other numeric columns "
@@ -611,8 +674,7 @@ def table_arithmetic_check(doc: Document) -> list[CheckFinding]:
                             quote=_table_quote(md, row),
                             category="consistency",
                             severity=0.7,
-                            meta={"table": tid, "row": row[0],
-                                  "reported": total, "computed": s},
+                            meta={"table": tid, "row": row[0], "reported": total, "computed": s},
                         )
                     )
     return findings

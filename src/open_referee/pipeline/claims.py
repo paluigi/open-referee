@@ -256,16 +256,12 @@ async def verify_claims(
                 try:
                     pass_results.append(await run_pass(claim, pass_idx))
                 except Exception as e:
-                    logger.warning(
-                        "claim %s pass %s failed: %s", claim.get("id"), pass_idx, e
-                    )
+                    logger.warning("claim %s pass %s failed: %s", claim.get("id"), pass_idx, e)
                     pass_results.append([])
             if passes == 1:
                 comments = pass_results[0]
             else:
-                comments = await _aggregate_passes(
-                    pipeline, pool, claim, pass_results, passes
-                )
+                comments = await _aggregate_passes(pipeline, pool, claim, pass_results, passes)
             # observed yield feeds the replanning committee
             h = getattr(pool, "harness", None)
             if h is not None and comments:

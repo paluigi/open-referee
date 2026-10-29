@@ -88,9 +88,10 @@ async def test_auto_escalates_on_empty_content():
     # phase 1 reasoning ran with the generous phase budget
     assert provider.calls[2]["spec"].call_max_tokens == 16384
     # phase 2 prompt carries the analysis
-    assert "prior analysis" in provider.calls[2]["user_tail"] or len(
-        provider.calls[2]["user_tail"]
-    ) > 0
+    assert (
+        "prior analysis" in provider.calls[2]["user_tail"]
+        or len(provider.calls[2]["user_tail"]) > 0
+    )
     # all four calls ledger-recorded under the same call type
     assert len(pool.ledger.calls) == 4
     assert all(c.call_type == "meta" for c in pool.ledger.calls)

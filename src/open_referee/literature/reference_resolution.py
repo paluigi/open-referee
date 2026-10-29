@@ -103,6 +103,7 @@ async def resolve_references(
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with CrossrefClient(cfg.crossref) as cr, OpenAlexClient(cfg.openalex) as oa:
+
         async def one(entry: str) -> dict:
             async with sem:
                 query = _query_for(entry)
@@ -141,8 +142,10 @@ async def resolve_references(
             except Exception as e:  # noqa: BLE001
                 logger.warning("reference resolution failed: %s", e)
                 return {
-                    "ref": entry[:240], "status": "unmatched",
-                    "score": 0.0, "error": str(e)[:120],
+                    "ref": entry[:240],
+                    "status": "unmatched",
+                    "score": 0.0,
+                    "error": str(e)[:120],
                 }
 
         try:
@@ -151,6 +154,8 @@ async def resolve_references(
             )
         except TimeoutError:
             logger.warning("reference resolution timed out after %ss", OVERALL_TIMEOUT_S)
-            out = [{"ref": e[:240], "status": "unmatched", "score": 0.0, "error": "timeout"}
-                   for e in entries]
+            out = [
+                {"ref": e[:240], "status": "unmatched", "score": 0.0, "error": "timeout"}
+                for e in entries
+            ]
     return list(out)

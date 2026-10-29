@@ -89,9 +89,7 @@ def _limits() -> None:  # preexec_fn in the child process
     resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
 
 
-def evaluate(
-    items: list[dict], *, timeout_s: int = DEFAULT_TIMEOUT_S
-) -> list[dict]:
+def evaluate(items: list[dict], *, timeout_s: int = DEFAULT_TIMEOUT_S) -> list[dict]:
     """Evaluate ``[{"expression": str, "subs": {name: number}}]`` in the sandbox.
 
     Returns one ``{"ok": bool, "value"?: float, "error"?: str}`` per item;

@@ -127,9 +127,16 @@ async def test_assemble_appends_checker_comments_with_provenance(tmp_path):
     final = {
         "paper_summary": "s",
         "overall_feedback": "## F",
-        "comments": [{"title": "LLM finding", "quote": "Body text.",
-                      "paragraph_anchor": "Body text.", "message": "m",
-                      "score": 0.5, "category": "clarity"}],
+        "comments": [
+            {
+                "title": "LLM finding",
+                "quote": "Body text.",
+                "paragraph_anchor": "Body text.",
+                "message": "m",
+                "score": 0.5,
+                "category": "clarity",
+            }
+        ],
     }
     report = await ReviewPipeline._assemble(pipeline, final, doc)
     titles = {c.title for c in report.comments}
@@ -155,9 +162,7 @@ async def test_meta_skips_synthesis_when_knob_off(tmp_path):
         field_hint = ""
 
     pool = StubPool()
-    draft = await ReviewPipeline._meta(
-        pipeline, pool, doc, {}, [], {"entries": []}, Pack()
-    )
+    draft = await ReviewPipeline._meta(pipeline, pool, doc, {}, [], {"entries": []}, Pack())
     assert [c for c, _ in pool.calls] == ["meta"]
     assert draft["overall_feedback"] == "## Merge"
 
@@ -201,9 +206,7 @@ async def test_dm_validator_gate_chunks_all_comments():
     pool = Pool()
     pool.decider = decider
 
-    comments = [
-        {"title": f"c{i}", "quote": "q", "paragraph_anchor": "a"} for i in range(75)
-    ]
+    comments = [{"title": f"c{i}", "quote": "q", "paragraph_anchor": "a"} for i in range(75)]
     kept = await ReviewPipeline._dm_validator_gate(pipeline, pool, doc, comments)
     # two chunked calls, first comment of chunk 1 dropped, everything else kept
     assert len(calls) == 2

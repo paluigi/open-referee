@@ -11,8 +11,7 @@ from open_referee.pipeline.budget import PlanKnobs, call_max_tokens
 from open_referee.pipeline.claims import _aggregate_passes, claim_role
 
 DOC = document_from_markdown(
-    "# T\n\n## 1 Model\n\nThe theorem holds under mild assumptions. "
-    + "body " * 80,
+    "# T\n\n## 1 Model\n\nThe theorem holds under mild assumptions. " + "body " * 80,
     source_format="md",
     title_hint="t",
 )
@@ -51,7 +50,9 @@ class StubPipeline:
 async def test_reproduced_finding_confirmed_without_arbitration():
     pool = StubPool()
     out = await _aggregate_passes(
-        StubPipeline(), pool, CLAIM,
+        StubPipeline(),
+        pool,
+        CLAIM,
         [[_comment("MAE aggregation undefined")], [_comment("MAE aggregation not defined")]],
         passes=2,
     )
@@ -63,9 +64,7 @@ async def test_reproduced_finding_confirmed_without_arbitration():
 @pytest.mark.asyncio
 async def test_single_pass_finding_requires_arbitration_confirm():
     pool = StubPool()
-    pool.arbitrate_verdicts = [
-        {"confirmed": True, "message": "Refined finding.", "severity": 0.8}
-    ]
+    pool.arbitrate_verdicts = [{"confirmed": True, "message": "Refined finding.", "severity": 0.8}]
     out = await _aggregate_passes(
         StubPipeline(), pool, CLAIM, [[_comment("Odd issue")], []], passes=2
     )
@@ -147,9 +146,7 @@ async def test_complete_json_applies_and_restores_max_tokens():
             seen.append(self.spec)
             from open_referee.providers.base import LLMResponse, Usage
 
-            return LLMResponse(
-                text='{"ok": true}', usage=Usage(input_tokens=1, output_tokens=1)
-            )
+            return LLMResponse(text='{"ok": true}', usage=Usage(input_tokens=1, output_tokens=1))
 
         async def close(self):
             pass
@@ -163,9 +160,7 @@ async def test_complete_json_applies_and_restores_max_tokens():
         )
     }
     pool.harness = None
-    out = await pool.complete_json(
-        ModelRole.STRONG, "s", "u", call_type="triage", max_tokens=16384
-    )
+    out = await pool.complete_json(ModelRole.STRONG, "s", "u", call_type="triage", max_tokens=16384)
     assert out == {"ok": True}
     assert seen[0].call_max_tokens == 16384
     assert seen[0].max_tokens == 4096
@@ -264,13 +259,11 @@ def test_dm_defense_batch_counts_scale_with_comments():
     role, est_in, est_out = h._base_unit("dm_defense")
     assert role == "decision" and est_in > 10_000 and est_out == 1
     # deep second round doubles the batches; a comment flood needs more batches
-    c_deep = h._call_counts(
-        PlanKnobs(defense_round=True, defense_second_round=True)
-    )
+    c_deep = h._call_counts(PlanKnobs(defense_round=True, defense_second_round=True))
     assert c_deep["dm_defense"] == 2
     h2, _ = make_harness(
-        budget=500.0, stats=DocumentStats(chars=200_000, n_sections=40, n_claims=150,
-                                         n_references=30)
+        budget=500.0,
+        stats=DocumentStats(chars=200_000, n_sections=40, n_claims=150, n_references=30),
     )
     c_big = h2._call_counts(PlanKnobs(defense_round=True, max_claims=150))
     # _est_comments = min(200, ceil(150*0.5) + 80) = 155 -> ceil(155/40) = 4

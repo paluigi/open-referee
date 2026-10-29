@@ -48,7 +48,8 @@ def test_existing_reference_not_flagged_and_duplicates_flagged():
         "# T\n\n## 1 Methods\n\nSee Figure 1 and Figure 2 for details. "
         + "body " * 80
         + "\n\n## Figure 1\n\ncaption one.\n\n## Figure 2\n\ncaption two.\n\n"
-        + "## Figure 2\n\ncaption two again.\n\n" + "tail " * 80
+        + "## Figure 2\n\ncaption two again.\n\n"
+        + "tail " * 80
     )
     findings = cross_reference_check(doc)
     assert not [f for f in findings if f.meta.get("kind") == "dangling"]
@@ -61,7 +62,8 @@ def test_existing_reference_not_flagged_and_duplicates_flagged():
 def test_conflicting_quantity_values_flagged():
     doc = _doc(
         "# T\n\n## Abstract\n\nThe model achieves a mean absolute error of 0.313 "
-        "percentage points overall. " + "filler " * 60
+        "percentage points overall. "
+        + "filler " * 60
         + "\n\n## 2 Results\n\nTable 2 reports a mean absolute error of 0.418 "
         "percentage points for the same setting. " + "filler " * 60
     )
@@ -192,8 +194,7 @@ async def test_recompute_confirms_real_mismatch():
 
     doc = _doc(
         "# T\n\n## 3 Model\n\nThe optimal frequency follows k* = sqrt(v/q) "
-        "with v=2.0 and q=8.0, giving k* = 0.9 percentage points. "
-        + "filler " * 40
+        "with v=2.0 and q=8.0, giving k* = 0.9 percentage points. " + "filler " * 40
     )
     extract = {
         "quantities": [
@@ -229,7 +230,8 @@ def test_recompute_excerpt_keeps_prose_formulas_alongside_tables():
 
     doc = _doc(
         "# T\n\n## 2 Data\n\nThe statistic is u = sqrt(v/q) with v = 2.0 and "
-        "q = 8.0, so u = 0.9 in all tables. " + "filler " * 40
+        "q = 8.0, so u = 0.9 in all tables. "
+        + "filler " * 40
         + "\n\n| A | B |\n|---:|---:|\n| 1.0 | 2.0 |\n\nTable 1: values."
     )
     excerpt = _excerpt(doc)

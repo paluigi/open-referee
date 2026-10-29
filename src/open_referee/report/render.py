@@ -100,12 +100,10 @@ def render_markdown(report: ReviewReport) -> str:
 
     # findings by relevance (severity), deterministic ones in their own section
     llm_comments = [
-        c for c in report.sorted_comments()
-        if (c.provenance or "") not in _DETERMINISTIC_PROVENANCE
+        c for c in report.sorted_comments() if (c.provenance or "") not in _DETERMINISTIC_PROVENANCE
     ]
     det_comments = [
-        c for c in report.sorted_comments()
-        if (c.provenance or "") in _DETERMINISTIC_PROVENANCE
+        c for c in report.sorted_comments() if (c.provenance or "") in _DETERMINISTIC_PROVENANCE
     ]
     parts += [f"## Findings ({len(llm_comments)})", ""]
     parts.append(

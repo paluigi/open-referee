@@ -297,13 +297,31 @@ async def test_chunked_claim_inventory_merges_ids(test_config, monkeypatch):
 
     pool = RolePool.build(test_config, {ModelRole.STRONG})
     strong = pool.providers[ModelRole.STRONG]
-    strong.queue(json.dumps({"claims": [
-        {"id": "x1", "type": "logical", "components": {"s": "a"},
-         "anchor": "claim text one", "section": "1", "importance": "central"},
-    ]}))
-    strong.queue(json.dumps({"claims": [
-        {"components": {"s": "b"}, "anchor": "claim text three"},
-    ]}))
+    strong.queue(
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "id": "x1",
+                        "type": "logical",
+                        "components": {"s": "a"},
+                        "anchor": "claim text one",
+                        "section": "1",
+                        "importance": "central",
+                    },
+                ]
+            }
+        )
+    )
+    strong.queue(
+        json.dumps(
+            {
+                "claims": [
+                    {"components": {"s": "b"}, "anchor": "claim text three"},
+                ]
+            }
+        )
+    )
 
     out = await run_claim_inventory(pool, doc, {"domain": "d"}, test_config)
     assert [c["id"] for c in out] == ["cl001", "cl002"]
@@ -344,9 +362,7 @@ async def test_defense_round_dm_batches_with_passages(test_config, sample_doc):
                         choice = "dismiss"
                     elif batch_no == 1 and idx == 3:
                         choice = "adjust"
-                    answers.append(
-                        DecisionAnswer(type="choice", name=q.name, choice=choice)
-                    )
+                    answers.append(DecisionAnswer(type="choice", name=q.name, choice=choice))
                 else:  # severity_<i>
                     answers.append(
                         DecisionAnswer(
@@ -438,8 +454,7 @@ async def test_defense_round_dm_batch_failure_upholds_that_batch(test_config, sa
             if dm_calls == 2:
                 raise LLMError("decision endpoint down")
             answers = [
-                DecisionAnswer(type="choice", name=q.name, choice="uphold")
-                for q in questions
+                DecisionAnswer(type="choice", name=q.name, choice="uphold") for q in questions
             ]
             return DecisionResult(answers=answers)
 
@@ -454,8 +469,14 @@ async def test_defense_round_dm_batch_failure_upholds_that_batch(test_config, sa
 
     pipeline._emit = _emit
     candidates = [
-        {"title": f"c{i}", "paragraph_anchor": "zzz", "quote": f"q{i}",
-         "message": "m", "score": 0.5, "category": "clarity"}
+        {
+            "title": f"c{i}",
+            "paragraph_anchor": "zzz",
+            "quote": f"q{i}",
+            "message": "m",
+            "score": 0.5,
+            "category": "clarity",
+        }
         for i in range(DM_BATCH_COMMENTS + 3)
     ]
     kept = await _defense_round_dm(pipeline, FakeDMPool(), sample_doc, candidates, test_config)

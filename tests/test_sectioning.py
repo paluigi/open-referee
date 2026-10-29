@@ -5,36 +5,52 @@ from __future__ import annotations
 from open_referee.ingestion.readers import document_from_markdown
 from open_referee.pipeline.orchestrator import _split_by_headings
 
-ANCHORED = """# Title
+ANCHORED = (
+    """# Title
 
 Author One, Author Two
 
 Abstract
 
-Filler abstract text. """ + "word " * 120 + """
+Filler abstract text. """
+    + "word " * 120
+    + """
 
 <a id="introduction"></a>## 1 Introduction
 
-First section body. """ + "sentence " * 200 + """
+First section body. """
+    + "sentence " * 200
+    + """
 
 <a id="conclusions"></a>## 5 Conclusions
 
-Closing body. """ + "sentence " * 200
-PLAIN = """Paper title line
+Closing body. """
+    + "sentence " * 200
+)
+PLAIN = (
+    """Paper title line
 
-Some front matter. """ + "text " * 200 + """
+Some front matter. """
+    + "text " * 200
+    + """
 
 1. Introduction
 
-Intro body. """ + "sentence " * 200 + """
+Intro body. """
+    + "sentence " * 200
+    + """
 
 2.3 Methods and data
 
-Methods body. """ + "sentence " * 200 + """
+Methods body. """
+    + "sentence " * 200
+    + """
 
 CONCLUSIONS
 
-Conclusions body. """ + "sentence " * 200
+Conclusions body. """
+    + "sentence " * 200
+)
 
 
 def test_anchored_markdown_headings_produce_sections():

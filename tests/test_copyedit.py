@@ -65,11 +65,17 @@ async def test_copyedit_keeps_locatable_quotes_and_drops_hallucinated():
                 "suggestion": "anything",
                 "kind": "grammar",
             },
-            {"quote": "the datas supports the claim", "suggestion": "the data support the claim",
-             "kind": "grammar"},
+            {
+                "quote": "the datas supports the claim",
+                "suggestion": "the data support the claim",
+                "kind": "grammar",
+            },
             {"quote": "", "suggestion": "no quote", "kind": "typo"},
-            {"quote": "framework is applied", "suggestion": "framework is utilized",
-             "kind": "synonym"},  # invalid kind -> dropped
+            {
+                "quote": "framework is applied",
+                "suggestion": "framework is utilized",
+                "kind": "synonym",
+            },  # invalid kind -> dropped
         ]
     }
     items = await ReviewPipeline._copyedit(StubPipeline(), StubPool(payload), DOC)
@@ -119,8 +125,12 @@ def test_markdown_annex_renders_between_notes_and_budget():
     report = _review_report()
     report.validator_notes = "validated."
     report.copyedit_items = [
-        CopyeditItem(quote="everywere in sciance", suggestion="everywhere in science",
-                     kind="typo", section="1 Introduction"),
+        CopyeditItem(
+            quote="everywere in sciance",
+            suggestion="everywhere in science",
+            kind="typo",
+            section="1 Introduction",
+        ),
     ]
     md = render_markdown(report)
     assert "## Suggested language fixes (1)" in md
