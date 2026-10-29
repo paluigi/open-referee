@@ -13,7 +13,23 @@ from open_referee.providers.base import (
     ModelSpec,
     Usage,
 )
-from open_referee.providers.factory import build_provider, provider_for_role
+from open_referee.providers.decisions import (
+    Choice,
+    ChoiceQuestion,
+    DecisionAnswer,
+    DecisionProvider,
+    DecisionResult,
+    FakeDecisionProvider,
+    Level,
+    PredicateQuestion,
+    Question,
+    ScoreQuestion,
+)
+from open_referee.providers.factory import (
+    build_decision_provider,
+    build_provider,
+    provider_for_role,
+)
 from open_referee.providers.usage import BudgetExceeded, UsageLedger
 
 __all__ = [
@@ -26,5 +42,16 @@ __all__ = [
     "UsageLedger",
     "BudgetExceeded",
     "build_provider",
+    "build_decision_provider",
     "provider_for_role",
+    "DecisionProvider",
+    "FakeDecisionProvider",
+    "DecisionResult",
+    "DecisionAnswer",
+    "Question",
+    "PredicateQuestion",
+    "ChoiceQuestion",
+    "ScoreQuestion",
+    "Choice",
+    "Level",
 ]

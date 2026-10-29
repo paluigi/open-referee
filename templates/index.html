@@ -17,8 +17,8 @@
       <a href="/settings">Settings</a>
     </nav>
   </header>
-  <main>
-    <section class="card" x-data="{busy:false}">
+  <main x-data="{busy:false, fitBusy:false}">
+    <section class="card">
       <h2>New review</h2>
       <form hx-post="/api/reviews" hx-target="#run-result" hx-encoding="multipart/form-data"
             @htmx:before-request="busy=true" @htmx:after-request="busy=false">
@@ -28,9 +28,65 @@
         <label>Related-work PDFs (optional, max 10)
           <input type="file" name="literature" multiple accept=".pdf,.docx,.tex,.md">
         </label>
+        <label>Depth
+          <select name="depth" id="depth-select">
+            <option value="default">Use settings default ({{ cfg.review.depth }})</option>
+            <option value="auto">Auto — budget-driven (est. floor: <span id="est-fast">…</span>)</option>
+            <option value="fast">fast — cheap pass, less detailed (est. <span data-est="fast">…</span>)</option>
+            <option value="standard">standard — full-depth review (est. <span data-est="standard">…</span>)</option>
+            <option value="deep">deep — max rigor: triple-pass, cross-model audit (est. <span data-est="deep">…</span>)</option>
+          </select>
+        </label>
+        <p class="muted small" id="estimate-note">Select a manuscript to get mechanical cost
+          estimates for the presets (no model is called).</p>
+        <details class="muted small">
+          <summary>What each depth does</summary>
+          <p><strong>fast</strong>: single-pass claim verification, deterministic checkers
+            (cross-references, number consistency, table arithmetic, DOI resolution),
+            whole-paper pass, concise synthesis.</p>
+          <p><strong>standard</strong>: everything in fast, plus two independent
+            verification passes per claim (findings must reproduce), strong-model routing
+            on numerical/table claims, full section×lens grid, defense gate, formula
+            recomputation, and the lead-referee synthesis essay.</p>
+          <p><strong>deep</strong>: three verification passes per claim with cross-model
+            auditing (configure an <code>auditor</code> role for true model independence),
+            all claims on the strong model, double defense rounds, maximum reasoning
+            budgets, up to 50 artifacts.</p>
+        </details>
+        <label>Budget for this run (USD, optional — cap in every mode, drives the planner in auto)
+          <input type="number" name="budget" step="0.5" min="0" placeholder="{{ '%g'|format(cfg.review.max_cost_usd) }}">
+        </label>
+        <details>
+          <summary class="muted">Target venue profile (optional — free-form journal aim/scope text
+            that informs the review)</summary>
+          <textarea name="journal_profile" rows="4"
+            placeholder="e.g. Journal of Applied Econometrics: empirical economics, strong identification focus, no theory-only papers, 8000-word limit…"></textarea>
+        </details>
         <button type="submit" :disabled="busy">Start review</button>
       </form>
       <div id="run-result"></div>
+    </section>
+
+    <section class="card">
+      <h2>Journal fit estimate <span class="pill">desk-reject chances</span></h2>
+      <p class="muted">Assess the probability that this paper passes the desk screen of a venue you
+        describe — aim, scope, profile, metrics, or institutional considerations for a working-paper
+        collection. One cheap pass; not a full review.</p>
+      <form hx-post="/api/fit" hx-target="#fit-result" hx-encoding="multipart/form-data"
+            @htmx:before-request="fitBusy=true" @htmx:after-request="fitBusy=false">
+        <label>Manuscript (PDF, DOCX, LaTeX, Markdown)
+          <input type="file" name="paper" accept=".pdf,.docx,.tex,.md,.markdown,.txt" required>
+        </label>
+        <label>Journal / venue profile (free-form)
+          <textarea name="journal_profile" rows="5" required
+            placeholder="e.g. General-interest economics journal (top-5 bar): broad audience, significant novelty required, polished prose…&#10;Institutions: we prioritize papers using our administrative data; policy relevance is a plus."></textarea>
+        </label>
+        <label>Budget for this run (USD, optional)
+          <input type="number" name="budget" step="0.5" min="0" placeholder="{{ '%g'|format(cfg.review.max_cost_usd) }}">
+        </label>
+        <button type="submit" :disabled="fitBusy">Estimate fit</button>
+      </form>
+      <div id="fit-result"></div>
     </section>
 
     <section class="card">
@@ -39,7 +95,9 @@
       <ul class="runs">
         {% for r in runs %}
         <li>
-          <a href="/review/{{ r.run_id }}">{{ r.paper_title or r.run_id }}</a>
+          <a href="/review/{{ r.run_id }}">
+            {% if r.run_type == 'fit' %}[fit] {% endif %}{{ r.paper_title or r.run_id }}
+          </a>
           <span class="pill pill-{{ r.status }}">{{ r.status }}</span>
           <span class="muted">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
         </li>
@@ -51,6 +109,46 @@
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(() => {});
     }
+    // mechanical preset estimates on file select (zero model calls)
+    const reviewForm = document.querySelector('form[hx-post="/api/reviews"]');
+    const paperInput = reviewForm ? reviewForm.querySelector('input[name="paper"]') : null;
+    if (paperInput) {
+      paperInput.addEventListener("change", async () => {
+        if (!paperInput.files.length) return;
+        const fd = new FormData();
+        fd.append("paper", paperInput.files[0]);
+        try {
+          const r = await fetch("/api/estimate", { method: "POST", body: fd });
+          const data = await r.json();
+          if (data.ok) {
+            document.querySelectorAll("[data-est]").forEach((el) => {
+              el.textContent = "$" + (+data.estimates_usd[el.dataset.est]).toFixed(2);
+            });
+            const fast = document.getElementById("est-fast");
+            if (fast) fast.textContent = "$" + (+data.estimates_usd.fast).toFixed(2);
+            const note = document.getElementById("estimate-note");
+            if (note) note.textContent =
+              "Estimates for this manuscript (mechanical, no model called): fast $" +
+              (+data.estimates_usd.fast).toFixed(2) + " · standard $" +
+              (+data.estimates_usd.standard).toFixed(2) + " · deep $" +
+              (+data.estimates_usd.deep).toFixed(2);
+          } else {
+            const note = document.getElementById("estimate-note");
+            if (note) note.textContent = "Estimates unavailable: " + (data.error || "").slice(0, 160);
+          }
+        } catch (e) { /* estimates are optional UX */ }
+      });
+    }
+    // both product forms return {"run_id": ...} — jump straight to the run page
+    document.body.addEventListener('htmx:afterRequest', (e) => {
+      const xhr = e.detail ? e.detail.xhr : null;
+      if (xhr && xhr.status === 200) {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          if (data.run_id) location.href = '/review/' + data.run_id;
+        } catch (err) { /* HTML fragment responses (settings) are not JSON */ }
+      }
+    });
   </script>
 </body>
 </html>

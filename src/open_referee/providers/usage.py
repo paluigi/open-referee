@@ -23,6 +23,7 @@ class CallRecord(BaseModel):
     input_tokens: int
     output_tokens: int
     estimated_cost_usd: float
+    call_type: str = "other"  # pipeline step that issued the call (budget tracking)
 
 
 class BudgetExceeded(RuntimeError):
@@ -68,7 +69,9 @@ class UsageLedger:
         if projected > self.cap_usd:
             raise BudgetExceeded(projected, self.cap_usd)
 
-    async def record(self, spec: ModelSpec, role: str, resp: LLMResponse) -> CallRecord:
+    async def record(
+        self, spec: ModelSpec, role: str, resp: LLMResponse, call_type: str = "other"
+    ) -> CallRecord:
         cost = self.estimate_cost(spec, resp.usage.input_tokens, resp.usage.output_tokens)
         rec = CallRecord(
             role=role,
@@ -77,6 +80,7 @@ class UsageLedger:
             input_tokens=resp.usage.input_tokens,
             output_tokens=resp.usage.output_tokens,
             estimated_cost_usd=round(cost, 6),
+            call_type=call_type,
         )
         async with self._lock:
             self.calls.append(rec)

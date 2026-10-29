@@ -40,11 +40,26 @@ content
 
 Rules:
 - One claim per item; do not bundle independent assertions.
-- Include the exact verbatim text of each component in the claim fields.
+- Include the exact verbatim text of each claim's components in the claim fields.
 - Prioritize claims that MATTER: central results first, load-bearing steps, \
 headline numbers. For a long paper, exhaust the important claims before the \
 peripheral ones.
 - Do not judge the claims; only catalogue them.
+
+Coverage duties (do not skip these claim families):
+- Overclaims and hedge removals: sentences asserting a property "for all", \
+"always", "trivial", "any dataset", "no risk remains" — catalogue the \
+asserted scope as a logical claim; the assertion itself is checkable.
+- Significance statements: "significant at the X percent level (p = ...)" — \
+catalogue the pair (level, p-value) as a numerical claim.
+- Figure/table descriptions in prose AND captions: catalogue both sides \
+(what the prose says the artifact shows, what the caption says) so the \
+pair can be compared.
+- Table-prose comparisons: every sentence asserting which category/row is \
+largest, smallest, best, or dominant relative to a table is a table_text \
+claim.
+These families matter even when the sentence looks minor: false small \
+claims are exactly what a referee must catch.
 
 Return STRICT JSON: {"claims": [{"id": "cl01", "type": "<one of the types>", \
 "importance": "central|supporting|peripheral", "components": {"<free keys per \
@@ -117,12 +132,22 @@ magnitude, significance stars, column/row the prose cites)?
 - Does the prose discuss the right specification/column/row? Are "significant" \
 and "insignificant" consistent with the table's stars or standard errors?
 - Are units and variable names consistent between table header and prose?""",
-    "figure_text": """Compare the figure/caption and the prose:
-- Does the prose describe what the figure actually shows (variables, \
-directions, levels, trends, breakpoints)?
-- Does the caption match the plotted content (axes, units, panels, legend)?
-- Any mismatch between prose claims ("the line crosses zero at x=2") and what \
-the figure shows?""",
+    "figure_text": """Compare the figure/caption and the prose as a PAIR of \
+descriptions:
+- State precisely what the caption says is plotted (variables, dimension or \
+conditioning: by class, over time, per period) and what the referencing \
+prose says the figure shows. If the two describe different content — a \
+different variable, a different axis or dimension, different conditions, \
+or a different grouping — flag the CONTRADICTION explicitly, quoting both \
+the caption and the prose sentence in the same comment. Do NOT soften a \
+caption-prose contradiction into a complaint about missing detail, \
+verifiability, or figure numbering; those are different (lesser) findings.
+- A caption describing different content than the referencing prose is a \
+substantive consistency error: use category "consistency", not "clarity".
+- If the figure image is provided, also check prose claims ("the line \
+crosses zero at x=2") against the plotted values (directions, magnitudes, \
+crossings, breakpoints, trends), and the caption against the actual axes, \
+units, panels, and legend.""",
     "citation_claim": """Judge whether the cited work supports the attached \
 claim, using ONLY the pack evidence for that work (title/abstract/metadata):
 - supported / overstated (claim stronger than the work's result) / \
@@ -271,3 +296,33 @@ Manuscript passage (anchor + context):
 ---
 {passage}
 ---"""
+
+# ------------------------------------------------------------ arbitration --
+
+ARBITRATE_SYSTEM = REFEREE_PERSONA + "\n\n" + SEVERITY_RUBRIC + """
+
+You are the ARBITER. A claim was verified by multiple independent passes; \
+exactly one pass flagged the issue below, the others found nothing wrong. \
+Decide whether the flagged issue is real.
+
+Respond with STRICT JSON:
+{{"confirmed": true|false,
+  "message": "if confirmed: the finding, stated precisely with what the paper \
+should do; if dismissed: one sentence on why",
+  "severity": 0.3-0.9}}
+
+Confirm only when the evidence in the claim components and quote supports a \
+genuine problem a careful author would need to address. Noise, taste, or \
+speculative concerns are dismissed."""
+
+ARBITRATE_USER = """Claim {claim_id} (type: {claim_type}):
+----
+{components}
+----
+
+Finding flagged by a single pass:
+Title: {title}
+Detail: {message}
+Quote: {quote}
+
+Is this a real issue? JSON only."""

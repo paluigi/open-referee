@@ -27,6 +27,7 @@ class ProviderType(str, Enum):
     GEMINI = "gemini"
     OLLAMA = "ollama"
     VLLM = "vllm"
+    DECISION = "decision"  # typed evaluation API (/v1/decisions), no free text
     FAKE = "fake"
 
 
@@ -34,6 +35,8 @@ class ModelRole(str, Enum):
     STRONG = "strong"
     SMALL = "small"
     VISION = "vision"
+    DECISION = "decision"
+    AUDITOR = "auditor"  # optional cross-model verifier for deep reviews
 
 
 class ProviderConfig(BaseModel):
@@ -59,6 +62,8 @@ class RoleConfig(BaseModel):
     model: str
     temperature: float = 0.2
     max_tokens: int = 4096
+    # reasoning-effort hint where the provider supports it (low|medium|high|xhigh)
+    reasoning_effort: str | None = None
 
 
 class LLMConfig(BaseModel):
@@ -67,6 +72,12 @@ class LLMConfig(BaseModel):
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
     request_timeout_s: float = 300.0
     max_retries: int = 3
+    # Two-phase JSON completion for reasoning models: "auto" escalates when a
+    # json_mode call returns empty content (reasoning consumed the budget),
+    # "always" skips the single-call attempt, "never" disables.
+    json_two_phase: str = "auto"
+    json_phase_reasoning_effort: str = "low"  # emission control for phase 2
+    json_phase_max_tokens: int = 24576  # phase-1 (free-form reasoning) budget
 
     @field_validator("roles", mode="before")
     @classmethod
@@ -97,13 +108,25 @@ class LLMConfig(BaseModel):
 class OpenAlexConfig(BaseModel):
     api_key_env: str = "OPENALEX_API_KEY"
     email: str | None = None
+    email_env: str = "OPENALEX_EMAIL"
 
     def resolved_api_key(self) -> str | None:
         return os.environ.get(self.api_key_env)
 
+    def resolved_email(self) -> str | None:
+        if self.email is not None:
+            return self.email
+        return os.environ.get(self.email_env) or os.environ.get("EMAIL")
+
 
 class CrossrefConfig(BaseModel):
     email: str | None = None
+    email_env: str = "CROSSREF_EMAIL"
+
+    def resolved_email(self) -> str | None:
+        if self.email is not None:
+            return self.email
+        return os.environ.get(self.email_env) or os.environ.get("EMAIL")
 
 
 class SearchEngineConfig(BaseModel):
@@ -142,21 +165,34 @@ class PeerReviewSourcesConfig(BaseModel):
 
 
 class DepthPreset(BaseModel):
-    """Call-budget preset. 'deep' approaches the hundreds-of-calls regime of
-    hosted deep-review tools; 'fast' trades depth for cost/latency."""
+    """Call-budget preset with the depth axes. 'standard' targets the quality
+    of hosted deep-review products (~$30-50/report class); 'deep' goes beyond
+    it (triple-pass verification, cross-model auditing when an auditor role is
+    configured, double defense); 'fast' is the cheap but still substantive
+    option."""
 
     max_claims: int = 60
     per_section_lenses: bool = True
     whole_paper_passes: bool = True
     defense_round: bool = True
     max_artifacts: int = 12
+    recompute: bool = True
+    verify_passes: int = 2
+    claim_routing: str = "strong"
+    output_budget: str = "default"
+    synthesis: bool = True
+    defense_second_round: bool = False
 
 
 class ReviewConfig(BaseModel):
     max_cost_usd: float = 10.0
     max_parallel_calls: int = 8
     max_user_literature_docs: int = 10
-    depth: str = "standard"  # fast | standard | deep
+    depth: str = "standard"  # fast | standard | deep | auto (budget-driven)
+
+    @property
+    def is_auto(self) -> bool:
+        return self.depth.lower().strip() == "auto"
 
     def depth_preset(self) -> DepthPreset:
         presets = {
@@ -166,6 +202,10 @@ class ReviewConfig(BaseModel):
                 whole_paper_passes=True,
                 defense_round=False,
                 max_artifacts=6,
+                recompute=False,
+                verify_passes=1,
+                claim_routing="base",
+                output_budget="low",
             ),
             "standard": DepthPreset(),
             "deep": DepthPreset(
@@ -173,12 +213,22 @@ class ReviewConfig(BaseModel):
                 per_section_lenses=True,
                 whole_paper_passes=True,
                 defense_round=True,
-                max_artifacts=25,
+                max_artifacts=50,
+                recompute=True,
+                verify_passes=3,
+                claim_routing="all_strong",
+                output_budget="high",
+                defense_second_round=True,
             ),
         }
         key = self.depth.lower().strip()
+        if key == "auto":
+            raise ValueError(
+                "depth 'auto' has no fixed preset — the budget planner sets the "
+                "knobs; use ReviewPipeline.plan_knobs() instead of depth_preset()"
+            )
         if key not in presets:
-            raise ValueError(f"Unknown depth preset '{self.depth}' (fast|standard|deep)")
+            raise ValueError(f"Unknown depth preset '{self.depth}' (fast|standard|deep|auto)")
         return presets[key]
 
 
@@ -247,6 +297,9 @@ def example_config_text() -> str:
                     "strong": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
                     "small": {"provider": "ollama", "model": "llama3.1:8b"},
                     "vision": {"provider": "gemini", "model": "gemini-2.5-flash"},
+                    # optional cross-model auditor: deep preset routes verification
+                    # passes 2+ here for true model independence
+                    # "auditor": {"provider": "openrouter", "model": "openai/gpt-5-mini"},
                 },
                 "pricing": {
                     "openrouter/anthropic/claude-sonnet-4.5": {
@@ -254,10 +307,18 @@ def example_config_text() -> str:
                         "output_per_mtok": 15.0,
                     },
                     "ollama/llama3.1:8b": {"input_per_mtok": 0.0, "output_per_mtok": 0.0},
+                    "gemini/gemini-2.5-flash": {
+                        "input_per_mtok": 0.30,
+                        "output_per_mtok": 2.5,
+                    },
                 },
             },
-            "openalex": {"api_key_env": "OPENALEX_API_KEY", "email": "you@institution.edu"},
-            "crossref": {"email": "you@institution.edu"},
+            "openalex": {
+                "api_key_env": "OPENALEX_API_KEY",
+                "email": "you@institution.edu",
+                "email_env": "OPENALEX_EMAIL",
+            },
+            "crossref": {"email": "you@institution.edu", "email_env": "CROSSREF_EMAIL"},
             "search": {
                 "order": ["tavily", "tinyfish", "brave"],
                 "tavily": {"api_key_env": "TAVILY_API_KEY", "enabled": True},
@@ -265,7 +326,12 @@ def example_config_text() -> str:
                 "brave": {"api_key_env": "BRAVE_API_KEY", "enabled": False},
             },
             "peer_review_sources": {"pubpeer": True, "openreview": True, "prereview": True},
-            "review": {"max_cost_usd": 10.0, "max_parallel_calls": 8},
+            "review": {
+                "max_cost_usd": 10.0,
+                "max_parallel_calls": 8,
+                # auto = budget-driven planner (requires llm.pricing entries)
+                "depth": "standard",
+            },
             "server": {"host": "127.0.0.1", "port": 8410},
         },
         sort_keys=False,

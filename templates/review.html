@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Review {{ run_id }} — Open Referee</title>
+  <title>{% if state.run_type == 'fit' %}Fit estimate{% else %}Review{% endif %} {{ run_id }} — Open Referee</title>
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
   <script src="/static/alpine.min.js" defer></script>
@@ -16,7 +16,76 @@
   <main x-data="{ tab: 'overall' }">
     <h1>{{ state.paper_title or run_id }} <span class="pill pill-{{ state.status }}">{{ state.status }}</span></h1>
 
-    {% if report %}
+    {% if state.status == 'incomplete' %}
+    <section class="card">
+      <h2>⚠️ Incomplete review</h2>
+      <p>{{ state.error or 'The run ran out of budget before completing all stages.' }}</p>
+      {% if state.shortfall_usd %}
+      <p>Estimated additional budget to finish: <strong>${{ '%.2f'|format(state.shortfall_usd) }}</strong></p>
+      {% endif %}
+      <form hx-post="/api/reviews/{{ run_id }}/resume" hx-target="#resume-result" class="inline-form">
+        <label>Resume with budget (USD)
+          <input type="number" name="budget" step="0.5" min="0"
+                 value="{{ '%.2f'|format((state.shortfall_usd or 0.5) * 2.5) }}" required>
+        </label>
+        <button type="submit">Resume run</button>
+      </form>
+      <div id="resume-result"></div>
+      <p class="muted small">Completed stages are reused — the run continues from where it stopped.</p>
+    </section>
+    {% endif %}
+    {% if report and state.run_type == 'fit' %}
+    <div class="tabs">
+      <a class="btn" href="/api/reviews/{{ run_id }}/report.pdf">PDF</a>
+      <a class="btn" href="/api/reviews/{{ run_id }}/report.md">Markdown</a>
+      <a class="btn" href="/api/reviews/{{ run_id }}/report">JSON</a>
+    </div>
+
+    <section class="card">
+      <h2>Probability of passing the desk screen</h2>
+      <p><strong>{{ '%.0f'|format(report.probability_not_desk_rejected * 100) }}%</strong>
+        (calibrated decision model){% if report.llm_holistic_estimate is not none %} ·
+        LLM holistic estimate: <strong>{{ '%.0f'|format(report.llm_holistic_estimate * 100) }}%</strong>{% endif %}</p>
+      {% if report.decision %}
+      <p class="muted small">Verdict by {{ "decision model over the editor's factor analyses"
+        if report.decision.source == 'decision-model' else "LLM fallback (no decision model configured)" }}
+        {% if report.decision.confidence is not none %} · confidence {{ '%.2f'|format(report.decision.confidence) }}{% endif %}</p>
+      {% endif %}
+
+      <h2>Factor assessment</h2>
+      {% for f in report.factors %}
+      <article class="comment">
+        <h3>{{ f.label }}</h3>
+        <p>{{ f.analysis }}</p>
+      </article>
+      {% endfor %}
+
+      {% if report.reasoning %}
+      <h2>Editor reasoning</h2>
+      <div class="prose">{% for line in report.reasoning.split('\n') %}{% if line.startswith('## ') %}<h3>{{ line[3:] }}</h3>{% elif line.startswith('# ') %}<h2>{{ line[2:] }}</h2>{% elif line.strip() %}<p>{{ line }}</p>{% endif %}{% endfor %}</div>
+      {% endif %}
+
+      {% if report.risks %}
+      <h2>Key risks</h2>
+      <ul>{% for r in report.risks %}<li>{{ r }}</li>{% endfor %}</ul>
+      {% endif %}
+      {% if report.suggestions %}
+      <h2>Suggestions to improve fit</h2>
+      <ul>{% for s in report.suggestions %}<li>{{ s }}</li>{% endfor %}</ul>
+      {% endif %}
+
+      <details>
+        <summary class="muted">Venue profile (as provided)</summary>
+        <blockquote>{{ report.journal_profile }}</blockquote>
+      </details>
+
+      {% if report.usage.estimated_cost_usd %}
+      <p class="muted">Usage: {{ '%d'|format(report.usage.total_input_tokens) }} in / {{ '%d'|format(report.usage.total_output_tokens) }} out tokens · est. ${{ '%.4f'|format(report.usage.estimated_cost_usd) }}</p>
+      {% endif %}
+      <p class="muted small"><a href="https://github.com/paluigi/open-referee">Built with open-referee</a></p>
+    </section>
+
+    {% elif report %}
     <div class="tabs">
       <button :class="{active: tab==='overall'}" @click="tab='overall'">Overall</button>
       <button :class="{active: tab==='comments'}" @click="tab='comments'">Comments ({{ report.comments | length }})</button>
@@ -31,9 +100,36 @@
       <h2>Overall feedback</h2>
       <div class="prose">{% for line in report.overall_feedback.split('\n') %}{% if line.startswith('## ') %}<h3>{{ line[3:] }}</h3>{% elif line.startswith('# ') %}<h2>{{ line[2:] }}</h2>{% elif line.strip() %}<p>{{ line }}</p>{% endif %}{% endfor %}</div>
       {% if report.validator_notes %}<h2>Validator notes</h2><div class="prose muted">{{ report.validator_notes }}</div>{% endif %}
+      {% if report.copyedit_items %}
+      <h2>Suggested language fixes ({{ report.copyedit_items|length }})</h2>
+      <p class="muted small">Mechanical language items from the copyedit pass — typos, grammar, phrasing, terminology. Quotes are verified to appear in the manuscript; copyedits, not findings.</p>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>#</th><th>Kind</th><th>Location</th><th>Original</th><th>Suggested fix</th></tr></thead>
+          <tbody>
+          {% for it in report.copyedit_items %}
+            <tr><td>{{ loop.index }}</td><td>{{ it.kind }}</td><td>{{ it.section or '—' }}</td><td>{{ it.quote }}</td><td>{{ it.suggestion }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+      {% if report.plan_summary %}
+      <h2>Budget</h2>
+      <p class="muted">
+        {% if report.plan_summary.budget_usd is not none %}budget ${{ '%.2f'|format(report.plan_summary.budget_usd) }} · {% endif %}
+        {% if report.plan_summary.target_usd is not none %}planned ${{ '%.2f'|format(report.plan_summary.target_usd) }} · {% endif %}
+        spent ${{ '%.2f'|format(report.plan_summary.spent_usd) }}
+        {% if report.plan_summary.control_spent_usd %} (incl. ${{ '%.2f'|format(report.plan_summary.control_spent_usd) }} planning overhead){% endif %}
+        — {{ report.plan_summary.mode }} mode{% if report.plan_summary.mode == 'auto' %}, {{ report.plan_summary.planner_calls_used }} planner call(s){% endif %}
+      </p>
+      {% for adj in report.plan_summary.adjustments %}<p class="muted small">adjustment: {{ adj }}</p>{% endfor %}
+      {% if report.plan_summary.notes %}<p class="muted small">{{ report.plan_summary.notes }}</p>{% endif %}
+      {% endif %}
       {% if report.usage.estimated_cost_usd %}
       <p class="muted">Usage: {{ '%d'|format(report.usage.total_input_tokens) }} in / {{ '%d'|format(report.usage.total_output_tokens) }} out tokens · est. ${{ '%.4f'|format(report.usage.estimated_cost_usd) }}</p>
       {% endif %}
+      <p class="muted small"><a href="https://github.com/paluigi/open-referee">Built with open-referee</a></p>
     </section>
 
     <section x-show="tab==='comments'" class="card">
@@ -51,7 +147,9 @@
     </section>
     {% else %}
     <section class="card" id="progress">
-      <h2>Reviewing…</h2>
+      <h2>{% if state.run_type == 'fit' %}Estimating fit…{% else %}Reviewing…{% endif %}</h2>
+      <div id="budget-panel" class="muted small"
+           {% if not state.events %}hidden{% endif %}></div>
       <ul id="stage-log">
         {% for ev in state.events %}
         <li>{{ ev.stage.value }} — {{ ev.status.value }} {{ ev.message }}</li>
@@ -59,12 +157,25 @@
       </ul>
       {% if state.status == 'running' %}
       <script>
+        const budgetPanel = document.getElementById('budget-panel');
+        const renderBudget = (b) => {
+          if (!b) return;
+          budgetPanel.hidden = false;
+          const bits = [];
+          if (b.budget_usd != null) bits.push(`budget $${(+b.budget_usd).toFixed(2)}`);
+          if (b.target_usd != null) bits.push(`planned $${(+b.target_usd).toFixed(2)}`);
+          if (b.actual_usd != null) bits.push(`spent $${(+b.actual_usd).toFixed(2)}`);
+          if (b.projected_final_usd != null) bits.push(`projected $${(+b.projected_final_usd).toFixed(2)}`);
+          budgetPanel.textContent = bits.join(' · ');
+        };
+        {% for ev in state.events %}{% if ev.data and ev.data.budget %}renderBudget({{ ev.data.budget | tojson }});{% endif %}{% endfor %}
         const es = new EventSource('/api/reviews/{{ run_id }}/events');
         es.onmessage = (e) => {
           const ev = JSON.parse(e.data);
           const li = document.createElement('li');
           li.textContent = `${ev.stage} — ${ev.status} ${ev.message || ''}`;
           document.getElementById('stage-log').appendChild(li);
+          if (ev.data && ev.data.budget) renderBudget(ev.data.budget);
           if (ev.stage === 'assemble' && (ev.status === 'done' || ev.status === 'failed')) {
             es.close();
             if (ev.status === 'done') location.reload();

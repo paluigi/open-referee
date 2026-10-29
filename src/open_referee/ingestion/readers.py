@@ -18,6 +18,8 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _NUMBERED_HEADING_RE = re.compile(
     r"^(?:(\d+(?:\.\d+)*)\.?|Appendix\s+([A-Z]))\s+([A-Z][^\n]{2,120})$"
 )
+# pandoc-style HTML anchors glued to the front of headings/paragraphs
+_ANCHOR_PREFIX_RE = re.compile(r"^(?:<a\b[^>]*>\s*(?:</a>)?\s*)+")
 _ABSTRACT_RE = re.compile(r"^\*{0,2}abstract\*{0,2}[:.]?\s*", re.I)
 _EQ_RE = re.compile(r"^\$\$(.+)\$\$$", re.S)
 _REF_RE = re.compile(r"^\*{0,2}(references|bibliography)\*{0,2}[:.]?\s*$", re.I)
@@ -55,7 +57,7 @@ def document_from_markdown(text: str, *, source_format: str, title_hint: str = "
     references_start: int | None = None
 
     for para in re.split(r"\n\s*\n", text):
-        para = para.strip()
+        para = _ANCHOR_PREFIX_RE.sub("", para.strip())
         if not para:
             continue
         hm = _HEADING_RE.match(para)

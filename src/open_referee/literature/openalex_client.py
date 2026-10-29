@@ -21,6 +21,7 @@ class OpenAlexClient:
     def __init__(self, cfg: OpenAlexConfig):
         self.cfg = cfg
         self._api_key = cfg.resolved_api_key()
+        self._email = cfg.resolved_email()
         self._client = None
         self._http = httpx.AsyncClient(base_url="https://api.openalex.org", timeout=30.0)
 
@@ -29,6 +30,7 @@ class OpenAlexClient:
             import openalexpy
 
             openalexpy.config.api_key = self._api_key
+            openalexpy.config.email = self._email
             self._client = openalexpy
             self._mode = "openalexpy"
         except ImportError:
@@ -59,7 +61,9 @@ class OpenAlexClient:
             except Exception:
                 logger.info("openalexpy DOI lookup failed for %s; trying REST", doi)
         try:
-            r = await self._http.get(f"/works/doi:{doi}", params=_params(self._api_key))
+            r = await self._http.get(
+                f"/works/doi:{doi}", params=_params(self._api_key, self._email)
+            )
             r.raise_for_status()
             return _rest_work_to_item(r.json())
         except Exception:
@@ -69,7 +73,9 @@ class OpenAlexClient:
         try:
             r = await self._http.get(
                 "/works",
-                params=_params(self._api_key, {"search": query, "per-page": str(limit)}),
+                params=_params(
+                    self._api_key, self._email, {"search": query, "per-page": str(limit)}
+                ),
             )
             r.raise_for_status()
             return [_rest_work_to_item(w) for w in r.json().get("results", [])]
@@ -127,10 +133,14 @@ class OpenAlexClient:
         )
 
 
-def _params(api_key: str | None, extra: dict[str, str] | None = None) -> dict[str, str]:
+def _params(
+    api_key: str | None, email: str | None = None, extra: dict[str, str] | None = None
+) -> dict[str, str]:
     p = dict(extra or {})
     if api_key:
         p["api_key"] = api_key
+    if email:
+        p["mailto"] = email
     return p
 
 

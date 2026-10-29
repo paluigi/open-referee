@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 from collections.abc import Sequence
 from typing import Any
@@ -24,6 +25,8 @@ from open_referee.providers.base import (
     ModelSpec,
     Usage,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class HTTPChatProvider(ChatProvider):
@@ -47,6 +50,15 @@ class HTTPChatProvider(ChatProvider):
             except (httpx.HTTPError, LLMError) as e:
                 last_err = e
                 if attempt < self.spec.max_retries:
+                    logger.warning(
+                        "%s/%s attempt %d failed (%s: %s); retrying in %.0fs",
+                        self.spec.provider_name,
+                        self.spec.model,
+                        attempt + 1,
+                        type(e).__name__,
+                        str(e)[:120],
+                        delay,
+                    )
                     await asyncio.sleep(delay)
                     delay *= 2
         raise LLMError(
@@ -93,8 +105,10 @@ class OpenAICompatibleProvider(HTTPChatProvider):
             "model": self.spec.model,
             "messages": [{"role": m.role, "content": content_of(m)} for m in messages],
             "temperature": self.spec.temperature,
-            "max_tokens": self.spec.max_tokens,
+            "max_tokens": self.spec.call_max_tokens or self.spec.max_tokens,
         }
+        if self.spec.reasoning_effort:
+            payload["reasoning_effort"] = self.spec.reasoning_effort
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         r = await self._client.post(self._url, json=payload, headers=self._headers)

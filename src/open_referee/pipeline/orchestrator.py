@@ -1,9 +1,12 @@
 """The review pipeline orchestrator.
 
-Stages: ingest -> triage -> survey -> scout -> verify (parallel per section)
--> challenge (parallel per section) -> bibliography -> meta -> validate ->
-assemble. Every stage persists its artifact so a run resumes where it left
-off. LLM role resolution and budget enforcement flow through a RolePool.
+Stages: ingest -> triage -> claims -> survey -> scout -> verify (parallel
+per section/claim) -> challenge (parallel per section) -> bibliography ->
+meta -> validate -> assemble. Every stage persists its artifact so a run
+resumes where it left off. LLM role resolution and budget enforcement flow
+through a RolePool; budget planning, tracking and steering flow through a
+BudgetHarness (pipeline/budget.py) that owns the plan and charges every
+call — including the planner's own — to the same budget.
 """
 
 from __future__ import annotations
@@ -26,17 +29,27 @@ from open_referee.literature import (
     SearchRouter,
 )
 from open_referee.pipeline import prompts
+from open_referee.pipeline.budget import (
+    BudgetHarness,
+    BudgetInfeasible,
+    DocumentStats,
+    PlanKnobs,
+    PricingError,
+    ReviewPlan,
+)
+from open_referee.pipeline.committee import ReviewIncomplete
 from open_referee.pipeline.state import RunState, Stage, StageEvent, StageStatus
 from open_referee.providers import (
     BudgetExceeded,
     ChatMessage,
     ChatProvider,
     LLMError,
+    LLMResponse,
     ModelSpec,
     UsageLedger,
 )
 from open_referee.report import ReviewComment, ReviewReport
-from open_referee.report.models import UsageSummary
+from open_referee.report.models import CopyeditItem, PlanSummary, UsageSummary
 from open_referee.report.render import render_markdown, render_pdf
 
 logger = logging.getLogger(__name__)
@@ -61,14 +74,30 @@ class RolePool:
     ledger: UsageLedger
     providers: dict[ModelRole, ChatProvider] = field(default_factory=dict)
     specs: dict[ModelRole, ModelSpec] = field(default_factory=dict)
+    decider: object | None = None  # DecisionProvider when llm.roles.decision is set
+    decider_spec: ModelSpec | None = None
+    harness: BudgetHarness | None = None  # budget tracking back-reference
 
     @classmethod
-    def build(cls, cfg: Config, roles: set[ModelRole]) -> RolePool:
-        from open_referee.providers.factory import build_provider
+    def build(cls, cfg: Config, roles: set[ModelRole], cap_usd: float | None = None) -> RolePool:
+        from open_referee.providers.factory import build_decision_provider, build_provider
 
-        pool = cls(cfg=cfg, ledger=UsageLedger(cfg.review.max_cost_usd, cfg.llm.pricing))
+        cap = cap_usd if cap_usd is not None else cfg.review.max_cost_usd
+        pool = cls(cfg=cfg, ledger=UsageLedger(cap, cfg.llm.pricing))
         for role in roles:
             role_cfg = cfg.llm.role(role)
+            if role is ModelRole.DECISION:
+                pool.decider = build_decision_provider(cfg.llm, role_cfg)
+                pool.decider_spec = ModelSpec(
+                    provider_name=role_cfg.provider,
+                    provider_type="decision",
+                    model=role_cfg.model,
+                    base_url=cfg.llm.providers[role_cfg.provider].base_url,
+                    api_key=cfg.llm.providers[role_cfg.provider].resolved_api_key(),
+                    timeout_s=cfg.llm.request_timeout_s,
+                    max_retries=cfg.llm.max_retries,
+                )
+                continue
             pool.providers[role] = build_provider(cfg.llm, role_cfg)
             pcfg = cfg.llm.providers[role_cfg.provider]
             pool.specs[role] = ModelSpec(
@@ -84,10 +113,131 @@ class RolePool:
             )
         return pool
 
-    async def complete_json(self, role: ModelRole, system: str, user: str) -> dict:
-        """JSON-mode completion with parse-repair retry, ledger check, usage record."""
+    async def decide(self, input: str, questions, call_type: str = "dm_other"):
+        """Typed decision call through the ledger: budget-checked, recorded,
+        harness-notified — decision calls are model calls like any other."""
+        if self.decider is None or self.decider_spec is None:
+            raise LLMError("No decision model configured (llm.roles.decision)")
+        est_in = max(1, len(input) // 3)
+        await self.ledger.check_budget(self.decider_spec, est_in, 1)
+        result = await self.decider.decide(input, questions)
+        shim = LLMResponse(text="", usage=result.usage)
+        rec = await self.ledger.record(self.decider_spec, "decision", shim, call_type=call_type)
+        if self.harness is not None:
+            self.harness.note_record(rec)
+        return result
+
+    async def complete_json(
+        self,
+        role: ModelRole,
+        system: str,
+        user: str,
+        call_type: str = "other",
+        max_tokens: int | None = None,
+    ) -> dict:
+        """JSON-mode completion with parse-repair retry, ledger check, usage record.
+
+        ``max_tokens`` overrides the role's output budget for this call only;
+        when omitted, the per-call-type budget from the plan's output_budget
+        level applies automatically (falling back to the role default for
+        unlisted call types).
+
+        Reasoning models can exhaust the output budget thinking before any
+        JSON is emitted (empty content). With llm.json_two_phase = "auto"
+        that signature escalates to a two-phase completion — phase 1 reasons
+        free-form (no JSON pressure, llm.json_phase_max_tokens budget),
+        phase 2 re-emits with llm.json_phase_reasoning_effort — validated by
+        the 2026-10-20 cross-provider survey (reasoning_effort low fixed
+        every failing family; thinking-disabled did not)."""
+        from open_referee.pipeline.budget import call_max_tokens
+
+        if max_tokens is None:
+            level = "default"
+            h = getattr(self, "harness", None)
+            if h is not None and h.plan is not None:
+                level = str(getattr(h.plan.knobs, "output_budget", "default"))
+            max_tokens = call_max_tokens(call_type, level)
         provider = self.providers[role]
         spec = self.specs[role]
+        eff_mt = max_tokens if max_tokens is not None else spec.max_tokens
+        override = max_tokens is not None and max_tokens != spec.max_tokens
+        if override:
+            # reuse the live provider (and its HTTP client); restore after
+            provider.spec = spec.model_copy(update={"call_max_tokens": max_tokens})
+        try:
+            return await self._complete_json_inner(
+                provider, spec, role, system, user, call_type, eff_mt
+            )
+        finally:
+            if override:
+                provider.spec = spec
+
+    def _json_two_phase_mode(self) -> str:
+        cfg = getattr(self, "cfg", None)
+        mode = getattr(getattr(cfg, "llm", None), "json_two_phase", "auto")
+        return mode if mode in ("auto", "always", "never") else "auto"
+
+    async def _two_phase_json(
+        self, provider, spec, role: ModelRole, system: str, user: str, call_type: str
+    ) -> dict | None:
+        """Phase 1: free-form reasoning. Phase 2: low-effort JSON emission
+        fed with the phase-1 analysis. Returns None when phase 1 also fails
+        (caller falls back to the single-call ladder)."""
+        messages = [
+            ChatMessage(role="system", content=system),
+            ChatMessage(role="user", content=user),
+        ]
+        p1_budget = max(int(getattr(self.cfg.llm, "json_phase_max_tokens", 16384)), spec.max_tokens)
+        saved = provider.spec
+        try:
+            provider.spec = spec.model_copy(update={"call_max_tokens": p1_budget})
+            resp1 = await provider.complete(messages, json_mode=False)
+            rec1 = await self.ledger.record(spec, role.value, resp1, call_type=call_type)
+            if self.harness is not None:
+                self.harness.note_record(rec1)
+        finally:
+            provider.spec = saved
+        analysis = (resp1.text or "").strip()
+        if not analysis:
+            return None
+
+        from open_referee.providers.adapters import extract_json
+
+        emission_effort = str(getattr(self.cfg.llm, "json_phase_reasoning_effort", "low"))
+        emit_system = (
+            system + "\n\nYou are given your own prior analysis of the task. Output ONLY "
+            "the required JSON object now — no prose, no code fences, no reasoning."
+        )
+        emit_user = (
+            f"Your prior analysis:\n----\n{analysis[-8000:]}\n----\n\n{user}\n\n"
+            "Based on the analysis above, output ONLY the required JSON now."
+        )
+        try:
+            provider.spec = spec.model_copy(update={"reasoning_effort": emission_effort})
+            resp2 = await provider.complete(
+                [
+                    ChatMessage(role="system", content=emit_system),
+                    ChatMessage(role="user", content=emit_user),
+                ],
+                json_mode=True,
+            )
+            rec2 = await self.ledger.record(spec, role.value, resp2, call_type=call_type)
+            if self.harness is not None:
+                self.harness.note_record(rec2)
+        finally:
+            provider.spec = saved
+        return extract_json(resp2.text)
+
+    async def _complete_json_inner(
+        self,
+        provider,
+        spec,
+        role: ModelRole,
+        system: str,
+        user: str,
+        call_type: str,
+        eff_mt: int | None = None,
+    ) -> dict:
         est_in = (len(system) + len(user)) // 3
         # rough output estimate: proportional to input, bounded — avoids
         # pre-charging max_tokens/2 on every call and tripping the cap early
@@ -97,26 +247,81 @@ class RolePool:
             ChatMessage(role="system", content=system),
             ChatMessage(role="user", content=user),
         ]
-        resp = await provider.complete(messages, json_mode=True)
-        await self.ledger.record(spec, role.value, resp)
+        mode = self._json_two_phase_mode()
+        resp = None
+        if mode != "always":
+            resp = await provider.complete(messages, json_mode=True)
+            rec = await self.ledger.record(spec, role.value, resp, call_type=call_type)
+            if self.harness is not None:
+                self.harness.note_record(rec)
+            from open_referee.providers.adapters import extract_json
+
+            try:
+                return extract_json(resp.text)
+            except json.JSONDecodeError:
+                pass  # fall through: repair, then two-phase if content was empty
+        # exhaustion signature: empty content (reasoning ate the budget)
+        empty_content = resp is None or not (resp.text or "").strip()
+        if mode == "auto" and empty_content:
+            # cheap escalation first: same call under the low-effort control
+            # (survey + live probes: reasoning spiral short-circuits, valid
+            # JSON in seconds) before the expensive free-form phase
+            emission_effort = str(getattr(self.cfg.llm, "json_phase_reasoning_effort", "low"))
+            saved_spec = provider.spec
+            try:
+                provider.spec = spec.model_copy(update={"reasoning_effort": emission_effort})
+                resp_low = await provider.complete(messages, json_mode=True)
+                rec_low = await self.ledger.record(spec, role.value, resp_low, call_type=call_type)
+                if self.harness is not None:
+                    self.harness.note_record(rec_low)
+            finally:
+                provider.spec = saved_spec
+            if (resp_low.text or "").strip():
+                from open_referee.providers.adapters import extract_json
+
+                try:
+                    return extract_json(resp_low.text)
+                except json.JSONDecodeError:
+                    pass
+        if mode == "always" or (mode == "auto" and empty_content):
+            try:
+                out = await self._two_phase_json(provider, spec, role, system, user, call_type)
+                if isinstance(out, dict):
+                    return out
+            except json.JSONDecodeError:
+                pass  # fall through to the repair ladder
+            except LLMError as e:
+                logger.warning("two-phase emission failed: %s", e)
         from open_referee.providers.adapters import extract_json
 
         try:
-            return extract_json(resp.text)
+            if resp is not None:
+                return extract_json(resp.text)
         except json.JSONDecodeError:
-            repair_user = (
-                f"{user}\n\nYour previous reply was not valid JSON. Reply again with ONLY the "
-                f"required JSON object, no prose, no code fences."
-            )
-            resp2 = await provider.complete(
-                [
-                    ChatMessage(role="system", content=system),
-                    ChatMessage(role="user", content=repair_user),
-                ],
-                json_mode=True,
-            )
-            await self.ledger.record(spec, role.value, resp2)
+            pass
+        repair_user = (
+            f"{user}\n\nYour previous reply was not valid JSON. Reply again with ONLY the "
+            f"required JSON object, no prose, no code fences."
+        )
+        resp2 = await provider.complete(
+            [
+                ChatMessage(role="system", content=system),
+                ChatMessage(role="user", content=repair_user),
+            ],
+            json_mode=True,
+        )
+        rec2 = await self.ledger.record(spec, role.value, resp2, call_type=call_type)
+        if self.harness is not None:
+            self.harness.note_record(rec2)
+        try:
             return extract_json(resp2.text)
+        except json.JSONDecodeError as e:
+            # never leak a raw decode error: stages catch LLMError and
+            # degrade gracefully instead of failing the whole run
+            raise LLMError(
+                f"{spec.provider_name}/{spec.model} returned no parseable JSON even "
+                f"after a repair attempt (last reply started: {resp2.text[:120]!r})"
+            ) from e
 
     async def close(self) -> None:
         for p in self.providers.values():
@@ -124,12 +329,31 @@ class RolePool:
 
 
 class ReviewPipeline:
-    def __init__(self, cfg: Config, run_id: str | None = None):
+    def __init__(
+        self,
+        cfg: Config,
+        run_id: str | None = None,
+        budget_usd: float | None = None,
+        journal_profile: str | None = None,
+        depth: str | None = None,
+    ):
         self.cfg = cfg
         self.run_id = run_id or uuid.uuid4().hex[:12]
+        self.requested_budget_usd = budget_usd
+        self.journal_profile = (journal_profile or "").strip() or None
+        self.requested_depth = (depth or cfg.review.depth).lower().strip()
         self.state: RunState | None = None
         self._subscribers: list[asyncio.Queue[StageEvent]] = []
         self._pool: RolePool | None = None
+        self._triage_cache: dict | None = None
+        self._claims_ranked = False
+        self._venue_block: str = ""
+        if self.journal_profile:
+            self._venue_block = (
+                "\n\n## Target venue profile (free-form, from the user)\n\n"
+                f"{self.journal_profile[:8000]}\n\n"
+                "Review with this venue's aims, scope and standards in mind.\n"
+            )
 
     # ---------------------------------------------------------------- events --
 
@@ -139,10 +363,20 @@ class ReviewPipeline:
         return q
 
     async def _emit(
-        self, stage: Stage, status: StageStatus, message: str = "", progress: float | None = None
+        self,
+        stage: Stage,
+        status: StageStatus,
+        message: str = "",
+        progress: float | None = None,
+        data: dict | None = None,
     ):
         ev = StageEvent(
-            run_id=self.run_id, stage=stage, status=status, message=message, progress=progress
+            run_id=self.run_id,
+            stage=stage,
+            status=status,
+            message=message,
+            progress=progress,
+            data=data or {},
         )
         for q in self._subscribers:
             await q.put(ev)
@@ -154,12 +388,18 @@ class ReviewPipeline:
     async def run(
         self, paper_path: str | Path, literature_paths: list[str | Path] | None = None
     ) -> ReviewReport:
-        state = RunState(
-            run_id=self.run_id,
-            paper_path=str(paper_path),
-            literature_paths=[str(p) for p in (literature_paths or [])],
-        )
+        state = self._load_or_create_state(paper_path, literature_paths)
+        resuming_incomplete = state.status == "incomplete"
+        if resuming_incomplete:
+            # restart-with-top-up: continue from persisted artifacts under the
+            # new budget without rerunning completed stages
+            state.status = "running"
+            state.error = None
         self.state = state
+        state.run_type = "review"
+        state.requested_depth = self.requested_depth
+        state.budget_usd = self.requested_budget_usd
+        state.journal_profile = self.journal_profile
         state.save()
         try:
             pool = await self._ensure_pool()
@@ -188,8 +428,19 @@ class ReviewPipeline:
             state.save()
             await self._emit(Stage.INGEST, StageStatus.DONE, doc.title)
 
+            # 1b. budget preflight + initial (deterministic) plan — free of LLM cost
+            await self._init_budget(pool, doc)
+            if resuming_incomplete and pool.harness is not None and pool.harness.plan is not None:
+                from open_referee.pipeline import committee
+
+                # pick up the continuation the new budget can afford
+                await committee.replan_choice(self, pool, "resume-topup")
+
             # 2. triage
-            triage = await self._stage_or_resume(Stage.TRIAGE, lambda: self._triage(pool, doc))
+            triage = await self._stage_or_resume(
+                Stage.TRIAGE, lambda: self._triage(pool, doc), skip_key="triage"
+            )
+            self._triage_cache = triage
             queries = triage.get("search_queries", [])[:8]
             key_citations = triage.get("key_citations", [])
 
@@ -197,6 +448,18 @@ class ReviewPipeline:
             claims = await self._stage_or_resume(
                 Stage.CLAIMS, lambda: self._claim_inventory(pool, doc, triage), skip_key="claims"
             )
+            # claims milestone: exact claim count is the dominant cost driver.
+            # claims are importance-ranked (decision model when available),
+            # then the committee commits a frontier path for the run.
+            if pool.harness is not None:
+                pool.harness.stats.n_claims = len(claims) if claims else 0
+            if self._is_auto() and not state.stage_status(Stage.VERIFY) == StageStatus.DONE:
+                from open_referee.pipeline import committee
+
+                claims = await committee.rank_claims(self, pool, claims)
+                self._claims_ranked = True
+                state.artifacts["claims"] = claims  # ranked order persists
+                await committee.strategy_committee(self, pool, claims)
 
             # 3+4. literature survey + community scout (concurrent)
             pack = await self._stage_or_resume(
@@ -204,22 +467,27 @@ class ReviewPipeline:
                 lambda: self._literature(pool, doc, triage, queries, key_citations, lit_docs),
                 skip_key="survey",
             )
+            if isinstance(pack, dict):
+                # resumed runs load artifacts as JSON: rebuild the ContextPack
+                pack = ContextPack.model_validate(pack)
             await self._stage_or_resume(
                 Stage.SCOUT, lambda: self._scout(pool, doc.title, key_citations, pack)
             )
 
-            # 5. verify: per-claim workers + section lenses (by depth) + artifacts + whole-paper
+            # 5. verify: per-claim workers + section lenses (by plan) + artifacts + whole-paper
             candidates = await self._stage_or_resume(
                 Stage.VERIFY,
                 lambda: self._verify(pool, doc, pack, triage, claims),
                 skip_key="candidates",
             )
+            await self._replan_checkpoint(pool, "verify")
             # 6. challenge
             validated = await self._stage_or_resume(
                 Stage.CHALLENGE,
                 lambda: self._challenge(pool, doc, pack, candidates),
                 skip_key="validated",
             )
+            await self._replan_checkpoint(pool, "challenge")
             # 7. bibliography
             bib = await self._stage_or_resume(
                 Stage.BIBLIOGRAPHY,
@@ -236,12 +504,31 @@ class ReviewPipeline:
             final = await self._stage_or_resume(
                 Stage.VALIDATE, lambda: self._validate(pool, doc, draft), skip_key="final_review"
             )
+            # 9b. copyedit annex (language mechanics; never blocks the report)
+            copyedit_items = await self._stage_or_resume(
+                Stage.COPYEDIT, lambda: self._copyedit(pool, doc), skip_key="copyedit_items"
+            )
             # 10. assemble
-            report = await self._assemble(final, doc)
+            report = await self._assemble(final, doc, copyedit_items)
             state.status = "completed"
             state.save()
             await self._emit(Stage.ASSEMBLE, StageStatus.DONE, "report ready")
+            self._record_history("completed")
             return report
+        except (PricingError, BudgetInfeasible) as e:
+            # pre-spend abort: no partial report is possible or meaningful
+            if state:
+                state.status = "failed"
+                state.error = str(e)
+                state.save()
+            self._record_history("failed", str(e))
+            await self._emit(Stage.ASSEMBLE, StageStatus.FAILED, f"cannot run: {e}")
+            raise
+        except ReviewIncomplete as e:
+            # wrap-up produced the best possible report; the run is resumable
+            # with a budget top-up (completed stages are reused)
+            self._record_history("incomplete", e.cause)
+            return e.report
         except BudgetExceeded as e:
             # Drain gracefully: assemble a partial report from whatever the
             # pipeline managed to produce before the spend cap tripped.
@@ -249,6 +536,7 @@ class ReviewPipeline:
                 state.status = "failed"
                 state.error = str(e)
                 state.save()
+            self._record_history("budget_exceeded", str(e))
             await self._emit(Stage.ASSEMBLE, StageStatus.FAILED, f"budget cap reached: {e}")
             doc: Document | None = getattr(self, "_ingested_doc", None)
             if doc is not None and state is not None:
@@ -279,6 +567,7 @@ class ReviewPipeline:
                 state.status = "failed"
                 state.error = str(e)
                 state.save()
+            self._record_history("failed", str(e))
             logger.exception("pipeline failed")
             raise
         finally:
@@ -287,16 +576,232 @@ class ReviewPipeline:
 
     # ---------------------------------------------------------------- helpers --
 
+    def _load_or_create_state(
+        self, paper_path: str | Path, literature_paths: list[str | Path] | None
+    ) -> RunState:
+        """Resume an interrupted run (same run_id) or start a fresh state."""
+        from open_referee.pipeline.state import _runs_dir
+
+        existing = _runs_dir() / self.run_id / "state.json"
+        if existing.exists():
+            try:
+                return RunState.load(self.run_id)
+            except Exception:
+                logger.warning("could not load state for %s; starting fresh", self.run_id)
+        return RunState(
+            run_id=self.run_id,
+            paper_path=str(paper_path),
+            literature_paths=[str(p) for p in (literature_paths or [])],
+        )
+
+    def _effective_depth(self) -> str:
+        if self.state is not None and self.state.requested_depth:
+            return self.state.requested_depth
+        return self.requested_depth
+
+    def _is_auto(self) -> bool:
+        return self._effective_depth() == "auto"
+
+    def _effective_budget(self) -> float:
+        if self.requested_budget_usd is not None:
+            return self.requested_budget_usd
+        return self.cfg.review.max_cost_usd
+
     async def _ensure_pool(self) -> RolePool:
         if self._pool is None:
             roles = {ModelRole.STRONG, ModelRole.SMALL}
-            try:
-                self.cfg.llm.role(ModelRole.VISION)
-                roles.add(ModelRole.VISION)
-            except KeyError:
-                pass
-            self._pool = RolePool.build(self.cfg, roles)
+            for extra in (ModelRole.VISION, ModelRole.DECISION, ModelRole.AUDITOR):
+                try:
+                    self.cfg.llm.role(extra)
+                    roles.add(extra)
+                except KeyError:
+                    pass
+            self._pool = RolePool.build(self.cfg, roles, cap_usd=self._effective_budget())
         return self._pool
+
+    # ---------------------------------------------------------------- budget --
+
+    async def _init_budget(self, pool: RolePool, doc: Document) -> None:
+        """Preflight + initial plan (no LLM cost).
+
+        Auto mode: pricing must be configured (hard error) and the budget
+        must clear the fast-preset floor for THIS paper (hard error listing
+        all three preset estimates — rejected before any model call).
+        Preset modes: uncapped by design — a deterministic estimate of the
+        chosen preset is tracked for the live view and the final
+        estimate-vs-actual report, but nothing is enforced in flight.
+        """
+        import math
+
+        harness = BudgetHarness(
+            self.cfg,
+            pool.ledger,
+            pool.specs,
+            budget_usd=self._effective_budget(),
+            auto=self._is_auto(),
+        )
+        harness.stats = DocumentStats.from_doc(doc)
+        if pool.decider_spec is not None:
+            harness.specs[ModelRole.DECISION] = pool.decider_spec
+        pool.harness = harness
+        if not self._is_auto():
+            # uncapped preset mode: estimate-only tracking, no enforcement
+            pool.ledger.cap_usd = math.inf
+        # resume: restore plan + spend accounting from persisted state
+        assert self.state is not None
+        if self.state.ledger_calls:
+            from open_referee.providers.usage import CallRecord
+
+            pool.ledger.calls = [CallRecord.model_validate(c) for c in self.state.ledger_calls]
+            for rec in pool.ledger.calls:
+                harness.note_record(rec)
+        if self.state.plan is not None:
+            try:
+                restored = ReviewPlan.model_validate(self.state.plan)
+                restored.budget_usd = self._effective_budget()
+                harness.set_plan(restored, reason="restored-resume")
+            except Exception:
+                logger.warning("could not restore persisted plan; replanning")
+        if harness.plan is not None:
+            return
+        try:
+            harness.require_pricing()
+        except PricingError as e:
+            if self._is_auto():
+                raise
+            logger.warning("pricing incomplete, budget tracking degraded: %s", e)
+        if self._is_auto():
+            # floor: reject budgets below the fast-preset estimate, zero model calls
+            est = harness.preset_estimates()
+            if harness.budget_usd < est["fast"]:
+                raise BudgetInfeasible(
+                    f"Budget ${harness.budget_usd:.2f} is below the cost of even a "
+                    f"'fast' review of this paper (≈ ${est['fast']:.2f}). Preset "
+                    f"estimates for this manuscript: fast ≈ ${est['fast']:.2f}, "
+                    f"standard ≈ ${est['standard']:.2f}, deep ≈ ${est['deep']:.2f}.",
+                    min_budget_usd=round(est["fast"], 2),
+                    standard_budget_usd=round(est["standard"], 2),
+                )
+            plan = harness.deterministic_plan(reason="preflight")
+            harness.set_plan(plan, reason="preflight-v0")
+            await self._emit_plan_event("plan v0 (deterministic preflight)", plan)
+        else:
+            depth = self._effective_depth()
+            knobs = PlanKnobs.from_preset(self.cfg.review.depth_preset())
+            plan = harness.preset_plan(knobs, depth)
+            harness.set_plan(plan, reason="preset-tracking")
+            await self._emit_plan_event(
+                f"preset '{depth}' — estimate ${plan.target_usd:.2f} (uncapped, "
+                "spend reported at the end)",
+                plan,
+            )
+        self._sync_budget_to_state()
+        self.state.save()
+
+    async def _emit_plan_event(self, message: str, plan: ReviewPlan) -> None:
+        st = self._pool.harness.status() if self._pool and self._pool.harness else {}
+        await self._emit(
+            Stage.PLAN,
+            StageStatus.RUNNING,
+            message,
+            data={"plan": plan.model_dump(mode="json"), "budget": st},
+        )
+
+    async def _replan_checkpoint(self, pool: RolePool, where: str) -> None:
+        """Checkpoint after stages/sub-stages: telemetry when on-plan; when the
+        harness flags a deviation (or a spike), rebuild the residual frontier
+        and let the committee pick a continuation. When NOTHING is feasible,
+        wrap up the review as incomplete (raises ReviewIncomplete)."""
+        from open_referee.pipeline import committee
+
+        harness = pool.harness
+        if harness is None or harness.plan is None:
+            return
+        reason = harness.should_replan()
+        st = harness.status()
+        if reason is None:
+            await self._emit(
+                Stage.PLAN,
+                StageStatus.RUNNING,
+                f"budget after {where}: ${st['actual_usd']:.2f} spent, "
+                f"${st['projected_final_usd']:.2f} projected of ${st['budget_usd']:.2f}",
+                data={"budget": st},
+            )
+            self._sync_budget_to_state()
+            return
+        applied = await committee.replan_choice(self, pool, reason)
+        if not applied:
+            await committee.wrapup_incomplete(self, pool, reason)
+        self.state.save()
+
+    def _sync_budget_to_state(self) -> None:
+        """Persist plan + ledger so a resumed run keeps spend accounting."""
+        if self.state is None or self._pool is None:
+            return
+        h = self._pool.harness
+        if h is not None:
+            self.state.plan = h.plan.model_dump(mode="json") if h.plan else None
+            self.state.ledger_calls = [c.model_dump(mode="json") for c in h.ledger.calls]
+
+    def _record_history(self, status: str, error: str | None = None) -> None:
+        """Append the per-phase estimation record (paper characteristics +
+        budget/spend detail) to the run-history store. Best-effort: a history
+        failure must never break the run itself."""
+        try:
+            from open_referee.pipeline.history import build_run_record, upsert_run_record
+
+            pool = getattr(self, "_pool", None)
+            if pool is None or pool.harness is None:
+                return
+            rec = build_run_record(
+                run_id=self.run_id,
+                run_type="review",
+                status=status,
+                harness=pool.harness,
+                events=self.state.events if self.state is not None else [],
+                paper_title=self.state.paper_title if self.state is not None else "",
+                depth_mode=self._effective_depth(),
+                error=error,
+                models={r.value: f"{p.provider_name}/{p.model}" for r, p in pool.specs.items()},
+            )
+            upsert_run_record(rec)
+        except Exception:
+            logger.exception("failed to record run history")
+
+    # --------------------------------------------------------- plan knobs --
+
+    def plan_knobs(self) -> PlanKnobs:
+        """Current plan knobs (harness plan if present, else depth preset)."""
+        pool = getattr(self, "_pool", None)
+        if pool is not None and pool.harness is not None:
+            plan = pool.harness.plan
+            if plan is not None:
+                return plan.knobs
+        return PlanKnobs.from_preset(self.cfg.review.depth_preset())
+
+    def budget_allows(self, call_type: str) -> bool:
+        """Fan-out gate: keeps the projection under the hard budget."""
+        pool = getattr(self, "_pool", None)
+        if pool is None or pool.harness is None:
+            return True
+        return pool.harness.allow_call(call_type)
+
+    def _note_gate_stop(self, call_type: str) -> None:
+        """Record + announce (once per call type) that the budget gate tripped."""
+        pool = getattr(self, "_pool", None)
+        if pool is None or pool.harness is None:
+            return
+        h = pool.harness
+        first = call_type not in h.gate_stopped
+        h.note_gate_stop(call_type, 1)
+        if first:
+            st = h.status()
+            logger.info(
+                "budget gate stopped %s (projected $%.2f of $%.2f)",
+                call_type,
+                st["projected_final_usd"],
+                st["budget_usd"],
+            )
 
     async def _stage_or_resume(self, stage: Stage, coro_fn, skip_key: str | None = None):
         assert self.state is not None, "run() must be invoked first"
@@ -316,6 +821,7 @@ class ReviewPipeline:
         self.state.set_stage(stage, StageStatus.DONE)
         if skip_key:
             self.state.artifacts[skip_key] = result
+        self._sync_budget_to_state()
         self.state.save()
         await self._emit(stage, StageStatus.DONE, progress=1.0)
         return result
@@ -331,14 +837,129 @@ class ReviewPipeline:
 
     # ----------------------------------------------------------------- stages --
 
+    def _build_plan_summary(self) -> PlanSummary | None:
+        """Telemetry for the report: how the run was budgeted vs actual."""
+        if self._pool is None or self._pool.harness is None:
+            return None
+        h = self._pool.harness
+        st = h.status()
+        notes: list[str] = []
+        for ct, skipped in sorted(h.gate_stopped.items()):
+            notes.append(f"{ct}: {skipped} unit(s) skipped by the budget gate")
+        plan = h.plan
+        return PlanSummary(
+            mode="auto" if self._is_auto() else self._effective_depth(),
+            budget_usd=st["budget_usd"],
+            target_usd=st["target_usd"],
+            planned_usd=st["planned_usd"],
+            spent_usd=st["actual_usd"],
+            control_spent_usd=st["control_actual_usd"],
+            projected_final_usd=st["projected_final_usd"],
+            planner_calls_used=st["planner_calls_used"],
+            adjustments=[
+                f"[{a.source}] {a.action}: {a.detail or a.reason}"
+                for a in (plan.adjustments if plan else [])
+            ],
+            notes="; ".join(notes) or None,
+        )
+
+    async def _dm_triage_classification(self, pool: RolePool, doc: Document) -> dict:
+        """Closed-set triage classification via the decision model (batched,
+        one call). Open-vocabulary fields stay with the LLM."""
+        if getattr(pool, "decider", None) is None:
+            return {}
+        from open_referee.providers.decisions import ChoiceQuestion, ScoreQuestion
+
+        abstract = doc.full_text()[:8000]
+        questions = [
+            ChoiceQuestion(
+                name="paper_type",
+                instructions="The manuscript's dominant type.",
+                choices=[{"value": v} for v in ("theory", "empirical", "mixed", "survey", "other")],
+            ),
+            ScoreQuestion(
+                name="mathematical_density",
+                instructions="Density of formal mathematics (theorems, proofs, derivations).",
+                levels=[{"label": v} for v in ("none", "light", "moderate", "heavy")],
+            ),
+            ChoiceQuestion(
+                name="statistical_content",
+                instructions="The kind of statistical/econometric content.",
+                choices=[
+                    {"value": v}
+                    for v in ("none", "descriptive", "inferential", "causal", "forecasting")
+                ],
+            ),
+            ChoiceQuestion(
+                name="methodological_style",
+                instructions="The dominant methodological style.",
+                choices=[
+                    {"value": v}
+                    for v in (
+                        "analytical-theory",
+                        "econometrics",
+                        "machine-learning",
+                        "simulation",
+                        "mixed",
+                    )
+                ],
+            ),
+        ]
+        try:
+            result = await pool.decide(
+                f"Manuscript: {doc.title}\n\n{abstract}", questions, call_type="dm_triage"
+            )
+        except LLMError as e:
+            logger.warning("DM triage classification failed (%s); LLM covers it", e)
+            return {}
+        out: dict = {}
+        a = result.answer("paper_type")
+        if a and a.choice:
+            out["paper_type"] = a.choice
+        a = result.answer("mathematical_density")
+        if a and a.probabilities:
+            # score level index -> label with the highest probability
+            best = max(a.probabilities, key=lambda d: d.get("probability", 0))
+            if isinstance(best.get("value"), int) and 0 <= best["value"] < 4:
+                out["mathematical_density"] = ["none", "light", "moderate", "heavy"][best["value"]]
+        for name in ("statistical_content", "methodological_style"):
+            a = result.answer(name)
+            if a and a.choice:
+                out[name] = a.choice
+        return out
+
     async def _triage(self, pool: RolePool, doc: Document) -> dict:
-        user = prompts.TRIAGE_USER.format(title=doc.title, manuscript=self._manuscript_trunc(doc))
-        return await pool.complete_json(ModelRole.STRONG, prompts.TRIAGE_SYSTEM, user)
+        # decision-model half: closed-set classification (skipped without a decider)
+        dm_class = await self._dm_triage_classification(pool, doc)
+        # LLM half: open-vocabulary domain + generative fields (queries, citations)
+        user = (
+            prompts.TRIAGE_USER.format(title=doc.title, manuscript=self._manuscript_trunc(doc))
+            + self._venue_block
+        )
+        if dm_class:
+            user += (
+                "\n\n## Classification already determined (use as given)\n\n"
+                + json.dumps(dm_class)
+                + "\nFocus your reply on domain, search queries, key citations, main claims.\n"
+            )
+        triage = await pool.complete_json(
+            ModelRole.STRONG, prompts.TRIAGE_SYSTEM, user, call_type="triage"
+        )
+        triage.update(dm_class)  # DM classification wins on shared keys
+        if pool.harness is not None:
+            pool.harness.stats.n_lenses = len(self._lenses_for(triage))
+        return triage
 
     async def _claim_inventory(self, pool: RolePool, doc: Document, triage: dict) -> list[dict]:
         from open_referee.pipeline.claims import run_claim_inventory
 
-        claims = await run_claim_inventory(pool, doc, triage, self.cfg)
+        claims = await run_claim_inventory(
+            pool,
+            doc,
+            triage,
+            self.cfg,
+            output_budget=str(getattr(self.plan_knobs(), "output_budget", "default")),
+        )
         await self._emit(Stage.CLAIMS, StageStatus.RUNNING, f"{len(claims)} claims catalogued")
         return claims
 
@@ -379,11 +1000,54 @@ class ReviewPipeline:
                 if key and key not in seen:
                     seen.add(key)
                     pack.items.append(it)
+            # decision-model relevance filter (batched predicates, one call):
+            # drop clearly irrelevant items before the surveyor reads the pack
+            if getattr(pool, "decider", None) is not None and pack.items:
+                from open_referee.providers.decisions import PredicateQuestion
+
+                q_items = "\n".join(
+                    f"{i}. {it.title[:120]} — {(it.why_relevant or '')[:80]}"
+                    for i, it in enumerate(pack.items[:40], 1)
+                )
+                qs = [
+                    PredicateQuestion(
+                        name=f"item_{i}",
+                        instructions=(
+                            f"Literature item {i} is relevant background for reviewing a "
+                            "manuscript in this field and should be kept in the context pack."
+                        ),
+                    )
+                    for i in range(1, min(len(pack.items), 40) + 1)
+                ]
+                try:
+                    dm = await pool.decide(
+                        f"Field: {triage.get('domain', 'unknown')}\n\nItems:\n{q_items}",
+                        qs,
+                        call_type="dm_survey",
+                    )
+                    kept = []
+                    for i, it in enumerate(pack.items[:40], 1):
+                        a = dm.answer(f"item_{i}")
+                        if a is None or a.probability is None or a.probability >= 0.5:
+                            kept.append(it)
+                    dropped = len(pack.items) - len(kept)
+                    pack.items = kept + pack.items[40:]
+                    if dropped:
+                        await self._emit(
+                            Stage.SURVEY,
+                            StageStatus.RUNNING,
+                            f"decision filter dropped {dropped} irrelevant literature items",
+                        )
+                except LLMError as e:
+                    logger.warning("DM survey filter failed (%s); keeping all items", e)
             # surveyor refines relevance + missing refs (small role) — still inside
             # the client contexts so Crossref lookups below remain valid
             try:
                 survey = await pool.complete_json(
-                    ModelRole.SMALL, prompts.SURVEY_SYSTEM, pack.render(max_items=30)
+                    ModelRole.SMALL,
+                    prompts.SURVEY_SYSTEM,
+                    pack.render(max_items=30),
+                    call_type="surveyor",
                 )
                 for sel in survey.get("selected", []):
                     idx = sel.get("index")
@@ -416,13 +1080,19 @@ class ReviewPipeline:
             await router.close()
 
     def _reviewable_sections(self, doc: Document) -> list[tuple[str, str]]:
-        """(title, text) for chunks worth verifying; falls back to one big chunk."""
+        """(title, text) for chunks worth verifying. Falls back to a
+        heading-heuristic split when parsing produced no sections or a single
+        degenerate one covering the whole document (plain-text conversions)."""
         out: list[tuple[str, str]] = []
         if doc.sections:
             for s in doc.sections:
                 text = "\n\n".join(b.text for b in doc.blocks[s.start_block : s.end_block])
                 if len(text) > 400:
                     out.append((s.title, text))
+        if len(out) <= 1:
+            split = _split_by_headings(doc.full_text())
+            if len(split) > len(out):
+                out = split
         if not out:
             out.append(("Full manuscript", doc.full_text()))
         return out
@@ -442,8 +1112,11 @@ class ReviewPipeline:
             lenses.append(("math", prompts.MATH_VERIFIER_SYSTEM))
         if stat_content not in ("", "none") or "empirical" in style or "causal" in stat_content:
             lenses.append(("empirical", prompts.EMPIRICAL_VERIFIER_SYSTEM))
-        # literature coherence always runs: cheap and central to the review
+        if stat_content not in ("", "none") or "empirical" in style:
+            lenses.append(("stats", prompts.STATS_VERIFIER_SYSTEM))
+        # literature coherence + clarity always run: cheap and central to the review
         lenses.append(("lit", prompts.LIT_VERIFIER_SYSTEM))
+        lenses.append(("clarity", prompts.CLARITY_VERIFIER_SYSTEM))
         return lenses
 
     async def _verify(
@@ -454,29 +1127,68 @@ class ReviewPipeline:
         triage: dict,
         claims: list[dict] | None = None,
     ) -> list[dict]:
+        from open_referee.pipeline.checkers import run_deterministic_checks
         from open_referee.pipeline.claims import verify_artifacts, verify_claims
+        from open_referee.pipeline.recompute import run_recompute
 
-        preset = self.cfg.review.depth_preset()
+        knobs = self.plan_knobs()
         candidates: list[dict] = []
+
+        # deterministic checkers: cross-references, number consistency, table
+        # arithmetic — zero LLM cost, findings stored on the run state
+        if not self.state.checker_findings:
+            det = run_deterministic_checks(doc)
+            self.state.checker_findings = [f.to_dict() for f in det]
+            if det:
+                kinds: dict[str, int] = {}
+                for f in det:
+                    kinds[f.check] = kinds.get(f.check, 0) + 1
+                await self._emit(
+                    Stage.VERIFY,
+                    StageStatus.RUNNING,
+                    "deterministic checks: "
+                    + ", ".join(f"{k}×{v}" for k, v in sorted(kinds.items())),
+                )
+        if knobs.recompute and not any(
+            f.get("check") == "recompute" for f in self.state.checker_findings
+        ):
+            try:
+                rec = await run_recompute(self, pool, doc, self.cfg)
+            except Exception as e:  # noqa: BLE001 - checker must never kill a run
+                logger.warning("recompute stage failed: %s", e)
+                rec = []
+            if rec:
+                self.state.checker_findings.extend(f.to_dict() for f in rec)
+                await self._emit(
+                    Stage.VERIFY,
+                    StageStatus.RUNNING,
+                    f"formula recomputation: {len(rec)} confirmed mismatch(es)",
+                )
 
         # per-claim verification workers (the primary engine)
         if claims:
             await self._emit(Stage.VERIFY, StageStatus.RUNNING, "per-claim verification")
             candidates.extend(await verify_claims(self, pool, doc, claims, self.cfg))
+        await self._replan_checkpoint(pool, "verify/claims")
 
         sections = self._reviewable_sections(doc)
-        lenses = self._lenses_for(triage) if preset.per_section_lenses else []
+        lenses = self._lenses_for(triage) if knobs.per_section_lenses else []
         sem = asyncio.Semaphore(self.cfg.review.max_parallel_calls)
 
         async def run_lens_section(lens_name: str, system: str, title: str, text: str):
             async with sem:
+                if not self.budget_allows("lens_section"):
+                    self._note_gate_stop("lens_section")
+                    return []
                 user = prompts.VERIFIER_USER.format(
                     section_title=f"{title} — {lens_name} lens",
                     context_block=self._pack_for_section(pack),
                     section_text=text[:40_000],
                 )
                 try:
-                    res = await pool.complete_json(ModelRole.SMALL, system, user)
+                    res = await pool.complete_json(
+                        ModelRole.SMALL, system, user, call_type="lens_section"
+                    )
                 except LLMError as e:
                     logger.warning("verifier (%s) failed on section %s: %s", lens_name, title, e)
                     return []
@@ -493,15 +1205,23 @@ class ReviewPipeline:
         results = await asyncio.gather(*tasks)
         for r in results:
             candidates.extend(r)
+            if r and pool.harness is not None:
+                pool.harness.note_yield(
+                    "lens_section", len(r), max((float(c.get("score", 0)) for c in r), default=0.0)
+                )
+        await self._replan_checkpoint(pool, "verify/lenses")
 
         # artifact verification: ALL figures and ALL tables vs prose (vision role)
         if ModelRole.VISION in pool.providers and (doc.figures or doc.tables):
             await self._emit(Stage.VERIFY, StageStatus.RUNNING, "artifact verification")
             art_comments = await verify_artifacts(self, pool, doc, self.cfg)
             candidates.extend(art_comments)
+            if art_comments and pool.harness is not None:
+                pool.harness.note_yield("artifact_verify", len(art_comments), 0.5)
+        await self._replan_checkpoint(pool, "verify/artifacts")
 
         # whole-paper pass: cross-section coherence (strong model, full text)
-        if not preset.whole_paper_passes:
+        if not knobs.whole_paper_passes:
             return candidates
         try:
             await self._emit(Stage.VERIFY, StageStatus.RUNNING, "whole-paper coherence pass")
@@ -509,9 +1229,19 @@ class ReviewPipeline:
                 title=doc.title, manuscript=self._manuscript_trunc(doc)
             )
             wp = await pool.complete_json(
-                ModelRole.STRONG, prompts.WHOLE_PAPER_VERIFIER_SYSTEM, wp_user
+                ModelRole.STRONG,
+                prompts.WHOLE_PAPER_VERIFIER_SYSTEM,
+                wp_user,
+                call_type="whole_paper_verify",
             )
-            candidates.extend(wp.get("comments", []))
+            wp_comments = wp.get("comments", [])
+            candidates.extend(wp_comments)
+            if wp_comments and pool.harness is not None:
+                pool.harness.note_yield(
+                    "whole_paper_verify",
+                    len(wp_comments),
+                    max((float(c.get("score", 0)) for c in wp_comments), default=0.0),
+                )
             await self._emit(
                 Stage.VERIFY,
                 StageStatus.RUNNING,
@@ -528,26 +1258,50 @@ class ReviewPipeline:
 
         async def run_section(title: str, text: str):
             async with sem:
+                if not self.budget_allows("section_challenger"):
+                    self._note_gate_stop("section_challenger")
+                    # challengers are validators: pass candidates through
+                    # unvalidated rather than dropping them
+                    return [
+                        c
+                        for c in candidates
+                        if c.get("paragraph_anchor", "") and _anchor_in(c["paragraph_anchor"], text)
+                    ]
                 cands = [
                     c
                     for c in candidates
                     if c.get("paragraph_anchor", "") and _anchor_in(c["paragraph_anchor"], text)
                 ]
-                user = prompts.CHALLENGER_USER.format(
-                    section_title=title,
-                    context_block=self._pack_for_section(pack),
-                    section_text=text[:40_000],
-                    candidates_json=json.dumps(cands, indent=1)[:20_000],
+                user = (
+                    prompts.CHALLENGER_USER.format(
+                        section_title=title,
+                        context_block=self._pack_for_section(pack),
+                        section_text=text[:40_000],
+                        candidates_json=json.dumps(cands, indent=1)[:20_000],
+                    )
+                    + self._venue_block
                 )
                 try:
                     res = await pool.complete_json(
-                        ModelRole.STRONG, prompts.CHALLENGER_SYSTEM, user
+                        ModelRole.STRONG,
+                        prompts.CHALLENGER_SYSTEM,
+                        user,
+                        call_type="section_challenger",
                     )
                 except LLMError as e:
                     logger.warning("challenger failed on %s: %s", title, e)
                     return cands
-                kept = [c for c in res.get("validated", []) if c.get("verdict") != "dropped"]
-                return kept + res.get("new_comments", [])
+                if isinstance(res, list):
+                    # bare validated list instead of the documented envelope
+                    res = {"validated": res}
+                if not isinstance(res, dict):
+                    res = {}
+                kept = [
+                    c
+                    for c in res.get("validated", [])
+                    if isinstance(c, dict) and c.get("verdict") != "dropped"
+                ]
+                return kept + [c for c in res.get("new_comments", []) if isinstance(c, dict)]
 
         tasks = [run_section(t, txt) for t, txt in sections]
         results = await asyncio.gather(*tasks)
@@ -556,6 +1310,8 @@ class ReviewPipeline:
 
         # whole-paper challenge: validate cross-section candidates (those no
         # section challenger claimed) and hunt missed global weaknesses
+        from open_referee.pipeline.claims import defense_round
+
         try:
             claimed = {
                 _norm(c.get("paragraph_anchor", ""))[:120]
@@ -568,24 +1324,42 @@ class ReviewPipeline:
                 for c in candidates
                 if isinstance(c, dict) and _norm(c.get("paragraph_anchor", ""))[:120] not in claimed
             ]
+            if not self.budget_allows("whole_paper_challenge"):
+                self._note_gate_stop("whole_paper_challenge")
+                validated.extend(wp_candidates)  # pass through unvalidated
+                return await defense_round(self, pool, doc, validated, self.cfg)
             await self._emit(Stage.CHALLENGE, StageStatus.RUNNING, "whole-paper challenge")
-            wp_user = prompts.WHOLE_PAPER_CHALLENGER_USER.format(
-                title=doc.title,
-                manuscript=self._manuscript_trunc(doc),
-                candidates_json=json.dumps(wp_candidates, indent=1)[:30_000],
+            wp_user = (
+                prompts.WHOLE_PAPER_CHALLENGER_USER.format(
+                    title=doc.title,
+                    manuscript=self._manuscript_trunc(doc),
+                    candidates_json=json.dumps(wp_candidates, indent=1)[:30_000],
+                )
+                + self._venue_block
             )
             wp = await pool.complete_json(
-                ModelRole.STRONG, prompts.WHOLE_PAPER_CHALLENGER_SYSTEM, wp_user
+                ModelRole.STRONG,
+                prompts.WHOLE_PAPER_CHALLENGER_SYSTEM,
+                wp_user,
+                call_type="whole_paper_challenge",
             )
-            kept = [c for c in wp.get("validated", []) if c.get("verdict") != "dropped"]
-            validated.extend(kept + wp.get("new_comments", []))
+            # models sometimes return the validated list bare instead of the
+            # documented {"validated": [...], "new_comments": [...]} envelope
+            if isinstance(wp, list):
+                wp = {"validated": wp}
+            if not isinstance(wp, dict):
+                wp = {}
+            kept = [
+                c
+                for c in wp.get("validated", [])
+                if isinstance(c, dict) and c.get("verdict") != "dropped"
+            ]
+            validated.extend(kept + [c for c in wp.get("new_comments", []) if isinstance(c, dict)])
             await self._emit(Stage.CHALLENGE, StageStatus.RUNNING, "whole-paper challenge done")
         except LLMError as e:
             logger.warning("whole-paper challenger failed: %s", e)
 
         # defense-adjudication quality gate (per comment, standard/deep only)
-        from open_referee.pipeline.claims import defense_round
-
         validated = await defense_round(self, pool, doc, validated, self.cfg)
         return validated
 
@@ -597,51 +1371,310 @@ class ReviewPipeline:
         }
         if not doc.references_text:
             return empty
+        resolution = await self._resolve_references(doc)
         intext = _extract_intext_citations(doc)
         user = prompts.BIBLIOGRAPHY_USER.format(
             references=doc.references_text[:30_000],
             intext=intext[:15_000],
+            resolution=resolution,
             context=pack.render(max_items=25),
         )
         try:
-            result = await pool.complete_json(ModelRole.SMALL, prompts.BIBLIOGRAPHY_SYSTEM, user)
+            result = await pool.complete_json(
+                ModelRole.SMALL, prompts.BIBLIOGRAPHY_SYSTEM, user, call_type="bibliography"
+            )
             result.setdefault("in_text_issues", [])
             return result
         except LLMError as e:
             logger.warning("bibliography audit failed: %s", e)
             return empty
 
+    async def _resolve_references(self, doc: Document) -> str:
+        """Free deterministic Crossref/OpenAlex pass over the reference list.
+
+        Results are stored on the run state as ground truth and rendered into
+        the bibliography prompt; unmatched entries become phantom-candidate
+        findings in the checker stream."""
+        if self.state.doi_resolutions:
+            return _render_resolutions(self.state.doi_resolutions)
+        from open_referee.literature.reference_resolution import resolve_references
+
+        try:
+            records = await resolve_references(doc.references_text or "", self.cfg)
+        except Exception as e:  # noqa: BLE001 - resolution is best-effort
+            logger.warning("reference resolution failed: %s", e)
+            records = []
+        self.state.doi_resolutions = records
+        unmatched = [r for r in records if r.get("status") != "matched"]
+        if unmatched:
+            from open_referee.pipeline.checkers import CheckFinding
+
+            for r in unmatched[:20]:
+                self.state.checker_findings.append(
+                    CheckFinding(
+                        check="doi-resolution",
+                        title="Reference not resolvable in Crossref/OpenAlex",
+                        message=(
+                            "The bibliography entry below could not be matched to "
+                            "any Crossref or OpenAlex record (best score "
+                            f"{r.get('score', 0)}). It may be phantom, garbled, or "
+                            "use an unusual rendering — verify it exists."
+                        ),
+                        quote=str(r.get("ref", ""))[:240],
+                        category="reference",
+                        severity=0.4,
+                        meta={"kind": "unmatched", "score": r.get("score", 0)},
+                    ).to_dict()
+                )
+        return _render_resolutions(records)
+
+    def _checker_comments(self) -> list[dict]:
+        """Deterministic checker findings as candidate comments: they join the
+        stream at meta (after defense, before validation) with their
+        provenance kept — mechanical findings skip the author-defense gate."""
+        out: list[dict] = []
+        for f in getattr(self.state, "checker_findings", None) or []:
+            try:
+                sev = min(0.95, max(0.1, float(f.get("severity", 0.5))))
+            except (TypeError, ValueError):
+                sev = 0.5
+            out.append(
+                {
+                    "title": str(f.get("title", "Finding"))[:160],
+                    "message": str(f.get("message", ""))[:2500],
+                    "paragraph_anchor": str(f.get("quote", ""))[:400],
+                    "quote": str(f.get("quote", ""))[:240],
+                    "score": sev,
+                    "category": str(f.get("category", "consistency")),
+                    "provenance": f.get("provenance", "deterministic"),
+                }
+            )
+        return out
+
     async def _meta(self, pool, doc, triage, validated, bib, pack) -> dict:
         bib_summary = {
             "entries": bib.get("entries", []),
             "in_text_issues": bib.get("in_text_issues", []),
         }
-        user = prompts.META_USER.format(
-            title=doc.title,
-            triage_json=json.dumps(triage)[:4000],
-            comments_json=json.dumps(validated, indent=1)[:60_000],
-            bib_summary=json.dumps(bib_summary)[:8000],
-            sota_notes=(pack.field_hint or "")[:1500],
+        # deterministic checker findings do NOT enter the merge: they are
+        # code-verified and already distinct — meta's dedup dissolved them
+        # (RMI: 20 doi + 8 xref findings merged into one prose comment).
+        # They are appended after validation, provenance intact.
+        merged = list(validated)
+        n_comments = len(merged)
+        # the preservation contract keeps every distinct finding, so both the
+        # input listing and the re-emitted output scale with comment count —
+        # static caps truncated large merges mid-JSON (RMI: 238 comments)
+        from open_referee.pipeline.budget import call_max_tokens
+
+        out_level = str(getattr(self.plan_knobs(), "output_budget", "default"))
+        meta_max = max(
+            call_max_tokens("meta", out_level) or 8192,
+            min(32_768, 2_000 + 130 * n_comments),
         )
-        return await pool.complete_json(ModelRole.STRONG, prompts.META_SYSTEM, user)
+        user = (
+            prompts.META_USER.format(
+                title=doc.title,
+                triage_json=json.dumps(triage)[:4000],
+                comments_json=json.dumps(merged, indent=1)[: max(100_000, 900 * n_comments)],
+                bib_summary=json.dumps(bib_summary)[:8000],
+                sota_notes=(pack.field_hint or "")[:1500],
+            )
+            + self._venue_block
+        )
+        draft = await pool.complete_json(
+            ModelRole.STRONG,
+            prompts.META_SYSTEM,
+            user,
+            call_type="meta",
+            max_tokens=meta_max,
+        )
+        # synthesis: the lead-referee essay over the deduplicated comments,
+        # replacing the merger's overall feedback with argued prose
+        if getattr(self.plan_knobs(), "synthesis", True) and self.budget_allows("synthesis"):
+            essay = await self._synthesis(pool, doc, triage, draft, bib, pack)
+            if essay:
+                draft["overall_feedback"] = essay
+        return draft
+
+    async def _synthesis(self, pool, doc, triage, draft, bib, pack) -> str | None:
+        comments = [c for c in draft.get("comments", []) if isinstance(c, dict)]
+        listing = "\n".join(
+            f"- [{float(c.get('score', 0) or 0):.2f}] "
+            f"({c.get('provenance', 'llm')}) {str(c.get('title', ''))[:110]} "
+            f":: {str(c.get('paragraph_anchor', ''))[:80]}"
+            for c in comments[:120]
+        )
+        bib_summary = json.dumps(
+            {
+                "entries": [
+                    {"raw": e.get("raw_entry", ""), "status": e.get("status", "")}
+                    for e in bib.get("entries", [])
+                    if isinstance(e, dict)
+                ][:40],
+                "in_text_issues": bib.get("in_text_issues", [])[:20],
+            }
+        )[:8000]
+        from open_referee.pipeline.budget import call_max_tokens
+
+        try:
+            res = await pool.complete_json(
+                ModelRole.STRONG,
+                prompts.SYNTHESIS_SYSTEM,
+                prompts.SYNTHESIS_USER.format(
+                    title=doc.title,
+                    triage_json=json.dumps(triage)[:3000],
+                    comments_listing=listing or "(no validated comments)",
+                    bib_summary=bib_summary,
+                    sota_notes=(pack.field_hint or "")[:1500],
+                    venue_block=self._venue_block,
+                ),
+                call_type="synthesis",
+                max_tokens=call_max_tokens(
+                    "synthesis", str(getattr(self.plan_knobs(), "output_budget", "default"))
+                ),
+            )
+        except LLMError as e:
+            logger.warning("synthesis pass failed: %s", e)
+            return None
+        essay = str(res.get("overall_feedback", "")).strip()
+        return essay or None
+
+    async def _dm_validator_gate(self, pool, doc, comments: list[dict]) -> list[dict]:
+        """Batched predicate per comment: is it grounded in the manuscript?
+        Ungrounded comments are dropped before the (strong) validator pass.
+        Batches of 60 questions per decision call, over ALL comments."""
+        if getattr(pool, "decider", None) is None or not comments:
+            return comments
+        from open_referee.providers.decisions import PredicateQuestion
+
+        kept: list[dict] = []
+        dropped = 0
+        for lo in range(0, len(comments), 60):
+            chunk = comments[lo : lo + 60]
+            listing = "\n".join(
+                f"{i}. [{c.get('title', '')[:60]}] quote={(c.get('quote') or '')[:100]} "
+                f"anchor={(c.get('paragraph_anchor') or '')[:80]}"
+                for i, c in enumerate(chunk, 1)
+            )
+            qs = [
+                PredicateQuestion(
+                    name=f"comment_{i}",
+                    instructions=(
+                        f"Review comment {i} quotes or paraphrases text that actually "
+                        "appears in the manuscript text provided above (not invented) — "
+                        "check the quote/anchor against that text."
+                    ),
+                )
+                for i in range(1, len(chunk) + 1)
+            ]
+            try:
+                dm = await pool.decide(
+                    f"Manuscript: {doc.title}\n\nManuscript text:\n---\n"
+                    f"{self._manuscript_trunc(doc)}\n---\n\nComments:\n{listing}",
+                    qs,
+                    call_type="dm_validate",
+                )
+            except LLMError as e:
+                logger.warning("DM validator gate failed (%s); keeping chunk", e)
+                kept.extend(chunk)
+                continue
+            for i, c in enumerate(chunk, 1):
+                a = dm.answer(f"comment_{i}")
+                if a is None or a.probability is None or a.probability >= 0.5:
+                    kept.append(c)
+                else:
+                    dropped += 1
+        if dropped:
+            await self._emit(
+                Stage.VALIDATE,
+                StageStatus.RUNNING,
+                f"decision gate dropped {dropped} ungrounded comments before validation",
+            )
+        return kept
 
     async def _validate(self, pool, doc, draft: dict) -> dict:
-        user = prompts.VALIDATOR_USER.format(
-            title=doc.title,
-            manuscript=self._manuscript_trunc(doc),
-            comments_json=json.dumps(draft.get("comments", []), indent=1)[:60_000],
-            overall=draft.get("overall_feedback", "")[:20_000],
+        gated = await self._dm_validator_gate(pool, doc, list(draft.get("comments", [])))
+        draft = dict(draft, comments=gated)
+        user = (
+            prompts.VALIDATOR_USER.format(
+                title=doc.title,
+                manuscript=self._manuscript_trunc(doc),
+                comments_json=json.dumps(draft.get("comments", []), indent=1)[:60_000],
+                overall=draft.get("overall_feedback", "")[:20_000],
+            )
+            + self._venue_block
         )
-        result = await pool.complete_json(ModelRole.STRONG, prompts.VALIDATOR_SYSTEM, user)
+        result = await pool.complete_json(
+            ModelRole.STRONG, prompts.VALIDATOR_SYSTEM, user, call_type="validate"
+        )
         # merge any fields the validator omitted from the draft
         result.setdefault("paper_summary", draft.get("paper_summary", ""))
         result.setdefault("overall_feedback", draft.get("overall_feedback", ""))
         result.setdefault("comments", draft.get("comments", []))
         return result
 
-    async def _assemble(self, final: dict, doc: Document) -> ReviewReport:
+    async def _copyedit(self, pool, doc: Document) -> list[dict]:
+        """Language-mechanics annex: one small-model pass producing verbatim
+        typo/phrasing fixes. Quotes are verified against the document with
+        the deterministic anchor resolver — items whose quotes cannot be
+        located are dropped (hallucination guard); no severity/defense/
+        validation gating applies (nothing here is a finding)."""
+        if not getattr(self.plan_knobs(), "copyedit", True):
+            return []
+        if not self.budget_allows("copyedit"):
+            self._note_gate_stop("copyedit")
+            return []
+        user = prompts.COPYEDIT_USER.format(title=doc.title, manuscript=self._manuscript_trunc(doc))
+        try:
+            res = await pool.complete_json(
+                ModelRole.SMALL, prompts.COPYEDIT_SYSTEM, user, call_type="copyedit"
+            )
+        except LLMError as e:
+            logger.warning("copyedit pass failed: %s", e)
+            return []
+        raw = res.get("items", []) if isinstance(res, dict) else []
+        out: list[dict] = []
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            quote = str(it.get("quote", "")).strip()
+            suggestion = str(it.get("suggestion", "")).strip()
+            kind = str(it.get("kind", "phrasing")).strip().lower()
+            if (
+                not quote
+                or not suggestion
+                or kind not in ("typo", "grammar", "phrasing", "terminology")
+            ):
+                continue
+            block_id, _conf = _resolve_anchor(doc, quote, quote)
+            if block_id is None:
+                continue  # quote not in the document — likely paraphrased
+            out.append(
+                {
+                    "quote": quote[:300],
+                    "suggestion": suggestion[:300],
+                    "kind": kind,
+                    "section": _section_of_block(doc, block_id),
+                }
+            )
+            if len(out) >= 40:
+                break
+        return out
+
+    async def _assemble(self, final: dict, doc: Document, copyedit_items=None) -> ReviewReport:
+        # deterministic checker findings bypass the LLM gates entirely:
+        # code-verified, already distinct, provenance kept — they render in
+        # the report's Deterministic checks section rather than being
+        # dissolved into meta-merged prose
+        final_comments = list(self._checker_comments()) + [
+            c for c in final.get("comments", []) if isinstance(c, dict)
+        ]
+        # provenance lost to meta/validator re-emission: re-attach from the
+        # verify-stage candidates
+        _reattach_provenance(final_comments, list(self.state.artifacts.get("candidates") or []))
         comments: list[ReviewComment] = []
-        for i, c in enumerate(final.get("comments", [])):
+        for i, c in enumerate(final_comments):
             try:
                 score = max(0.0, min(1.0, float(c.get("score", 0.3))))
             except (TypeError, ValueError):
@@ -661,6 +1694,7 @@ class ReviewPipeline:
                     score=score,
                     category=c.get("category") or "general",
                     anchor_confidence=confidence,
+                    provenance=c.get("provenance") or None,
                 )
             )
         u = self._pool.ledger if self._pool else None
@@ -671,6 +1705,7 @@ class ReviewPipeline:
             total_input_tokens=int(u.total_tokens()[0]) if u else 0,
             total_output_tokens=int(u.total_tokens()[1]) if u else 0,
         )
+        plan_summary = self._build_plan_summary()
         report = ReviewReport(
             run_id=self.run_id,
             paper_title=doc.title,
@@ -683,6 +1718,12 @@ class ReviewPipeline:
                 for r, p in (self._pool.specs if self._pool else {}).items()
             },
             validator_notes=final.get("validator_notes"),
+            plan_summary=plan_summary,
+            copyedit_items=[
+                CopyeditItem.model_validate(it)
+                for it in (copyedit_items or [])
+                if isinstance(it, dict)
+            ],
         )
         # persist report + exports into the run dir
         rdir = _runs_dir() / self.run_id
@@ -777,6 +1818,45 @@ def _anchor_in(anchor: str, text: str) -> bool:
     return _norm(anchor)[:120] in _norm(text)
 
 
+def _reattach_provenance(final_comments: list[dict], sources: list[dict]) -> None:
+    """Deterministically re-attach provenance that model re-emissions dropped.
+
+    The meta merger and the validator rebuild every comment dict per the
+    JSON comment schema, which has no provenance field — so multi-pass
+    badges ("claim_verify 2-of-2") and the deterministic/recompute tags
+    never reached the report. Matching is mechanical: exact normalized
+    quote/anchor keys first, then the difflib title+message similarity the
+    claim engine already uses. Only fills gaps; never overwrites."""
+    indexed = [s for s in sources if isinstance(s, dict) and s.get("provenance")]
+    if not indexed:
+        return
+    from open_referee.pipeline.claims import _similar_comments
+
+    by_quote: dict[str, str] = {}
+    by_anchor: dict[str, str] = {}
+    for s in indexed:
+        q = _norm(s.get("quote") or "")[:120]
+        a = _norm(s.get("paragraph_anchor") or "")[:120]
+        if q:
+            by_quote.setdefault(q, str(s["provenance"]))
+        if a:
+            by_anchor.setdefault(a, str(s["provenance"]))
+    for c in final_comments:
+        if not isinstance(c, dict) or c.get("provenance"):
+            continue
+        q = _norm(c.get("quote") or "")[:120]
+        a = _norm(c.get("paragraph_anchor") or "")[:120]
+        if q and q in by_quote:
+            c["provenance"] = by_quote[q]
+        elif a and a in by_anchor:
+            c["provenance"] = by_anchor[a]
+        else:
+            for s in indexed:
+                if _similar_comments(c, s):
+                    c["provenance"] = str(s["provenance"])
+                    break
+
+
 def _resolve_anchor(doc: Document, anchor: str, quote: str) -> tuple[str | None, float]:
     """Fuzzy-resolve a comment to a block. Returns (block_id, confidence)."""
     if anchor:
@@ -814,9 +1894,88 @@ def _section_of_block(doc: Document, block_id: str | None) -> str | None:
     return None
 
 
+_FALLBACK_MD_RE = re.compile(r"^#{1,3}\s+(\S.*)$")  # markdown
+_FALLBACK_NUM_RE = re.compile(
+    r"^(?:\d{1,2}(?:\.\d+)*\.?|Appendix\s+[A-Z])\s+[A-Z].{2,120}$"
+)  # numbered section lines
+_FALLBACK_KW_RE = re.compile(
+    r"^(?:abstract|references|bibliography|appendix|conclusions?)\s*$", re.I
+)
+_FALLBACK_CAPS_RE = re.compile(r"^[A-Z][A-Z0-9 :&\-]{3,60}$")
+_FALLBACK_MIN_CHARS = 400
+_FALLBACK_MAX_SECTIONS = 20
+
+
+def _split_by_headings(text: str) -> list[tuple[str, str]]:
+    """Split full text into (title, chunk) pairs when no sections were parsed.
+
+    Detects markdown headings, numbered section lines ('2.3 Methods'), keyword
+    headings (Abstract/References/...) and short ALL-CAPS title lines; skips
+    author-list style caps lines (commas, long). Chunks below the minimum
+    length merge into the previous section."""
+    lines = text.split("\n")
+    boundaries: list[tuple[int, str]] = []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if len(s) < 3 or len(s) > 130:
+            continue
+        if m := _FALLBACK_MD_RE.match(s):
+            boundaries.append((i, m.group(1).strip()))
+            continue
+        if _FALLBACK_NUM_RE.match(s):
+            boundaries.append((i, s))
+            continue
+        if _FALLBACK_KW_RE.match(s):
+            boundaries.append((i, s.title()))
+            continue
+        if _FALLBACK_CAPS_RE.match(s) and "," not in s and len(s.split()) <= 8:
+            boundaries.append((i, s))
+    if not boundaries:
+        return []
+
+    sections: list[list[str]] = []
+    titles: list[str] = []
+    if boundaries[0][0] > 0:
+        sections.append(lines[: boundaries[0][0]])
+        titles.append("Front matter")
+    for bi, (start, title) in enumerate(boundaries):
+        end = boundaries[bi + 1][0] if bi + 1 < len(boundaries) else len(lines)
+        sections.append(lines[start:end])
+        titles.append(title)
+
+    out: list[tuple[str, str]] = []
+    for title, chunk_lines in zip(titles, sections, strict=True):
+        chunk = "\n".join(chunk_lines).strip()
+        if not chunk:
+            continue
+        if len(chunk) < _FALLBACK_MIN_CHARS and out:
+            out[-1] = (out[-1][0], out[-1][1] + "\n\n" + chunk)
+        else:
+            out.append((title, chunk))
+    while len(out) > _FALLBACK_MAX_SECTIONS:
+        last = out.pop()
+        out[-1] = (out[-1][0], out[-1][1] + "\n\n" + last[1])
+    return out
+
+
 def _hit_to_item(hit, why: str):
     from open_referee.literature.context import LiteratureItem
 
     return LiteratureItem(
         source="web", title=hit.title, url=hit.url, abstract=hit.snippet, why_relevant=why
     )
+
+
+def _render_resolutions(records: list[dict]) -> str:
+    if not records:
+        return "(resolution unavailable)"
+    lines = []
+    for r in records:
+        if r.get("status") == "matched":
+            lines.append(
+                f"- MATCHED {r.get('doi') or 'no-doi'} :: {str(r.get('title'))[:110]} "
+                f"({r.get('venue') or '?'}, {r.get('year') or '?'}) [score {r.get('score')}]"
+            )
+        else:
+            lines.append(f"- UNMATCHED :: {str(r.get('ref'))[:110]} [best score {r.get('score')}]")
+    return "\n".join(lines)[:20_000]

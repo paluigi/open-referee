@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from conftest import overall_json, triage_json, validator_json
 from open_referee.config import ModelRole
 from open_referee.pipeline import Stage, StageStatus
@@ -125,7 +127,9 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
     small.queue(
         json.dumps({"selected": [], "state_of_the_art_notes": "n/a", "missing_references": []})
     )
-    # per-claim worker (small for cross_reference would be small; theorem_proof -> strong)
+    # per-claim worker: standard preset verifies twice; identical scripted
+    # findings reproduce -> confirmed 2-of-2 without arbitration
+    strong.queue(_script_comments("claim"))
     strong.queue(_script_comments("claim"))
     for _ in range(n_verify):
         small.queue(_script_comments("lens"))
@@ -159,7 +163,38 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
             )
         )
     strong.queue(overall_json())
+    strong.queue(json.dumps({"overall_feedback": "## Synth"}))  # synthesis
     strong.queue(validator_json())
+    # copyedit annex: intercepted by prompt (the defense queue above is
+    # over-provisioned, so FIFO position is not reliable here)
+    _orig_small_once = small._complete_once
+
+    async def _copyedit_aware(messages, *, json_mode):
+        if any("meticulous copyeditor" in m.content for m in messages):
+            from open_referee.providers.base import LLMResponse, Usage
+
+            return LLMResponse(
+                text=json.dumps(
+                    {
+                        "items": [
+                            {
+                                "quote": "Widget networks are everywhere",
+                                "suggestion": "Widget networks are present everywhere",
+                                "kind": "phrasing",
+                            },
+                            {
+                                "quote": "This quote is not in the manuscript.",
+                                "suggestion": "x",
+                                "kind": "typo",
+                            },
+                        ]
+                    }
+                ),
+                usage=Usage(input_tokens=100, output_tokens=50),
+            )
+        return await _orig_small_once(messages, json_mode=json_mode)
+
+    small._complete_once = _copyedit_aware
 
     events: list = []
     q = pipeline.subscribe()
@@ -189,6 +224,19 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
     assert report.model_roles["strong"] == "fake/strong-fake"
     assert report.usage.total_input_tokens > 0
 
+    # copyedit annex: locatable item kept, hallucinated quote dropped
+    assert len(report.copyedit_items) == 1
+    assert report.copyedit_items[0].kind == "phrasing"
+    md_e2e = (runs_dir / "e2e01" / "report.md").read_text()
+    assert "## Suggested language fixes (1)" in md_e2e
+    assert "This quote is not in the manuscript" not in md_e2e
+
+    # provenance re-attachment: meta/validator rebuilds drop the field, the
+    # deterministic matcher restores it from the verify-stage candidates
+    prov = [c.provenance for c in report.comments if c.provenance]
+    assert "claim_verify 2-of-2" in prov
+    assert "[claim_verify 2-of-2]" in md_e2e
+
     # persistence assertions
     assert (runs_dir / "e2e01" / "report.json").exists()
     assert (runs_dir / "e2e01" / "report.md").exists()
@@ -208,3 +256,354 @@ async def test_full_pipeline_e2e(test_config, sample_paper_file, monkeypatch, tm
         Stage.META,
         Stage.VALIDATE,
     } <= stages_seen
+
+
+async def test_auto_mode_budget_driven_e2e(test_config, sample_paper_file, monkeypatch, tmp_path):
+    """Auto (budget-driven) mode: deterministic preflight plan -> one planner
+    LLM call after the claims milestone -> validated knobs drive the run; the
+    planner call itself is budgeted and appears in usage."""
+
+    home = tmp_path / "home"
+    runs_dir = home / "runs"
+    import open_referee.config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG_DIR", home)
+    monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG_PATH", home / "config.yaml")
+    test_config.review.depth = "auto"
+    test_config.llm.pricing = {
+        "fake/strong-fake": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
+        "fake/small-fake": {"input_per_mtok": 0.3, "output_per_mtok": 2.5},
+    }
+
+    async def _fake_literature(self, pool, doc, triage, queries, key_citations, lit_docs):
+        from open_referee.literature import ContextPack
+
+        pack = ContextPack(paper_title=doc.title, field_hint="network science")
+        pack.user_docs = []
+        return pack
+
+    async def _fake_scout(self, pool, title, key_citations, pack):
+        return None
+
+    async def _fake_bib(self, pool, doc, pack):
+        return {"entries": [], "missing_key_references": []}
+
+    monkeypatch.setattr(ReviewPipeline, "_literature", _fake_literature)
+    monkeypatch.setattr(ReviewPipeline, "_scout", _fake_scout)
+    monkeypatch.setattr(ReviewPipeline, "_bibliography", _fake_bib)
+
+    pipeline = ReviewPipeline(test_config, run_id="auto01")
+    pool = await pipeline._ensure_pool()
+    strong = pool.providers[ModelRole.STRONG]
+    small = pool.providers[ModelRole.SMALL]
+
+    doc = await __import__("asyncio").to_thread(
+        __import__("open_referee.ingestion.readers", fromlist=["ingest_document"]).ingest_document,
+        sample_paper_file,
+    )
+    sections = pipeline._reviewable_sections(doc)
+    triage = json.loads(triage_json())
+    lenses = pipeline._lenses_for(triage)
+    n_verify = len(sections) * len(lenses)
+    n_sections = len(sections)
+
+    # control plane first
+    strong.queue(triage_json())  # triage
+    strong.queue(  # claim inventory
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "id": "cl01",
+                        "type": "theorem_proof",
+                        "importance": "central",
+                        "components": {
+                            "statement": "Theorem 1. Every widget network is stable.",
+                            "proof": "(none given)",
+                        },
+                        "anchor": "Theorem 1. Every widget network is stable.",
+                        "section": "3. Main result",
+                    }
+                ]
+            }
+        )
+    )
+    strong.queue(  # strategy committee: LLM reflection (strong model, no decider here)
+        json.dumps(
+            {
+                "draft": "Small theory paper; claim-focused review.",
+                "critique": "Breadth passes are cheap here; keep whole-paper.",
+                "evaluation_summary": "Lean claims plus whole-paper pass.",
+                "preferred_path": "claims-light",
+            }
+        )
+    )
+    small.queue(  # surveyor
+        json.dumps({"selected": [], "state_of_the_art_notes": "n/a", "missing_references": []})
+    )
+    strong.queue(_script_comments("claim"))  # per-claim worker
+    for _ in range(n_verify):
+        small.queue(_script_comments("lens"))
+    strong.queue(_script_comments("whole-paper"))  # whole-paper verify pass
+    for title, _ in sections:
+        strong.queue(_script_challenge(title))
+    strong.queue(_script_challenge("whole-paper"))
+    n_defended = n_sections * 2 + 1 + 1
+    for i in range(n_defended):
+        small.queue(json.dumps({"defense": "weak", "defense_strength": "weak"}))
+        strong.queue(
+            json.dumps(
+                {
+                    "verdict": "upheld",
+                    "reason": "ok",
+                    "comment": {
+                        "title": f"upheld-{i}",
+                        "paragraph_anchor": "Theorem 1. Every widget network is stable.",
+                        "quote": "Every widget network is stable",
+                        "message": "State and prove the theorem or cite a source.",
+                        "score": 0.75,
+                        "category": "math",
+                    },
+                }
+            )
+        )
+    strong.queue(overall_json())
+    strong.queue(json.dumps({"overall_feedback": "## Synth"}))  # synthesis
+    strong.queue(validator_json())
+
+    report = await pipeline.run(sample_paper_file)
+
+    # budget-mode assertions
+    assert report.plan_summary is not None
+    assert report.plan_summary.mode == "auto"
+    assert report.plan_summary.budget_usd == 100.0
+    assert report.plan_summary.spent_usd > 0
+    assert report.plan_summary.planner_calls_used >= 1
+    # the planner call itself is budgeted: it flows through the ledger (small)
+    assert pipeline._pool.harness.done.get("planner", 0) >= 1
+
+    # plan events were emitted for the live view
+    plan_events = [ev for ev in pipeline.state.events if ev.stage is Stage.PLAN]
+    assert plan_events, "expected Stage.PLAN events"
+    assert any(ev.data.get("plan") for ev in plan_events)
+    assert any(ev.data.get("budget") for ev in plan_events)
+
+    # the committee committed a feasible frontier path (by construction)
+    h = pipeline._pool.harness
+    assert h.plan.based_on == "frontier"
+    assert h.plan.knobs.max_claims <= 150
+    assert h.plan.planned_cost() <= h.effective_budget()
+    assert any(
+        a.reason == "strategy-committee" and a.action.startswith("frontier:")
+        for a in h.plan.adjustments
+    )
+
+    # state persisted plan + ledger for resume accounting
+    state = __import__("open_referee.pipeline.state", fromlist=["RunState"]).RunState.load(
+        "auto01", runs_dir=runs_dir
+    )
+    assert state.status == "completed"
+    assert state.plan is not None and state.plan["based_on"] == "frontier"
+    assert state.ledger_calls, "ledger calls should persist for resume"
+    planner_calls = [c for c in state.ledger_calls if c["call_type"] == "planner"]
+    assert planner_calls, "planner call must be charged to the budget"
+
+    # rendered report carries build metadata + attribution
+    md = (runs_dir / "auto01" / "report.md").read_text()
+    assert "## Build metadata" in md
+    assert "Built with [open-referee](https://github.com/paluigi/open-referee)" in md
+    assert "$" in md
+
+    # run history: per-phase estimation record persisted for calibration
+    from open_referee.pipeline.history import load_run_history
+
+    history = load_run_history(home / "run_history.jsonl")
+    rec = next(r for r in history if r["run_id"] == "auto01")
+    assert rec["run_type"] == "review" and rec["status"] == "completed"
+    assert rec["depth_mode"] == "auto"
+    assert rec["paper"]["n_claims"] == 1
+    assert rec["budget"]["actual_usd"] > 0
+    assert rec["stages"]["verify"]["actual"]["cost_usd"] > 0
+    assert rec["stages"]["triage"]["control_plane"] is True
+    assert rec["stages"]["triage"]["duration_s"] is not None
+    reasons = [e["reason"] for e in rec["plan_log"]]
+    assert "preflight-v0" in reasons
+    assert any(r.startswith("frontier:") for r in reasons)  # committee commit
+    assert any(e["call_type"] == "planner" for e in rec["spend_timeline"])
+    assert rec["call_types"]["claim_verify"]["actual_input_per_call"] is not None
+    assert rec["pricing"]["fake/strong-fake"]["input_per_mtok"] == 3.0
+
+
+async def test_resume_restores_spend_accounting(
+    test_config, sample_paper_file, monkeypatch, tmp_path
+):
+    """A re-run with the same run_id resumes completed stages and restores
+    the ledger from persisted call records (no fresh-ledger reset)."""
+
+    home = tmp_path / "home"
+    import open_referee.config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG_DIR", home)
+    monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG_PATH", home / "config.yaml")
+    test_config.review.depth = "auto"
+    test_config.llm.pricing = {
+        "fake/strong-fake": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
+        "fake/small-fake": {"input_per_mtok": 0.3, "output_per_mtok": 2.5},
+    }
+
+    async def _fake_literature(self, pool, doc, triage, queries, key_citations, lit_docs):
+        from open_referee.literature import ContextPack
+
+        pack = ContextPack(paper_title=doc.title, field_hint="network science")
+        return pack
+
+    async def _fake_scout(self, pool, title, key_citations, pack):
+        return None
+
+    async def _fake_bib(self, pool, doc, pack):
+        return {"entries": [], "missing_key_references": []}
+
+    monkeypatch.setattr(ReviewPipeline, "_literature", _fake_literature)
+    monkeypatch.setattr(ReviewPipeline, "_scout", _fake_scout)
+    monkeypatch.setattr(ReviewPipeline, "_bibliography", _fake_bib)
+
+    # first run: reuse the scripted queue from the auto e2e by running it with
+    # a planner noop response
+    pipeline = ReviewPipeline(test_config, run_id="resume01")
+    pool = await pipeline._ensure_pool()
+    strong = pool.providers[ModelRole.STRONG]
+    small = pool.providers[ModelRole.SMALL]
+
+    doc = await __import__("asyncio").to_thread(
+        __import__("open_referee.ingestion.readers", fromlist=["ingest_document"]).ingest_document,
+        sample_paper_file,
+    )
+    sections = pipeline._reviewable_sections(doc)
+    triage = json.loads(triage_json())
+    lenses = pipeline._lenses_for(triage)
+    n_verify = len(sections) * len(lenses)
+    n_sections = len(sections)
+
+    strong.queue(triage_json())
+    strong.queue(
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "id": "cl01",
+                        "type": "theorem_proof",
+                        "importance": "central",
+                        "components": {"statement": "Theorem 1", "proof": "(none)"},
+                        "anchor": "Theorem 1. Every widget network is stable.",
+                        "section": "3. Main result",
+                    }
+                ]
+            }
+        )
+    )
+    strong.queue(
+        json.dumps(
+            {
+                "draft": "ok",
+                "critique": "ok",
+                "evaluation_summary": "continue",
+                "preferred_path": "lean-core",
+            }
+        )
+    )
+    small.queue(json.dumps({"selected": [], "state_of_the_art_notes": "n/a"}))
+    strong.queue(_script_comments("claim"))
+    for _ in range(n_verify):
+        small.queue(_script_comments("lens"))
+    strong.queue(_script_comments("whole-paper"))
+    for title, _ in sections:
+        strong.queue(_script_challenge(title))
+    strong.queue(_script_challenge("whole-paper"))
+    n_defended = n_sections * 2 + 1 + 1
+    for i in range(n_defended):
+        small.queue(json.dumps({"defense": "weak", "defense_strength": "weak"}))
+        strong.queue(
+            json.dumps(
+                {
+                    "verdict": "upheld",
+                    "reason": "ok",
+                    "comment": {
+                        "title": f"upheld-{i}",
+                        "paragraph_anchor": "Theorem 1. Every widget network is stable.",
+                        "quote": "Every widget network is stable",
+                        "message": "State and prove the theorem or cite a source.",
+                        "score": 0.75,
+                        "category": "math",
+                    },
+                }
+            )
+        )
+    strong.queue(overall_json())
+    strong.queue(json.dumps({"overall_feedback": "## Synth"}))  # synthesis
+    strong.queue(validator_json())
+
+    report1 = await pipeline.run(sample_paper_file)
+    spent1 = report1.usage.estimated_cost_usd
+    calls1 = len(pipeline._pool.ledger.calls)
+    assert calls1 > 0
+
+    # second run, same run_id: everything resumes; ledger is restored from state
+    pipeline2 = ReviewPipeline(test_config, run_id="resume01")
+    report2 = await pipeline2.run(sample_paper_file)
+    h2 = pipeline2._pool.harness
+    assert h2 is not None
+    assert len(h2.ledger.calls) == calls1, "resume must restore the persisted ledger"
+    assert report2.usage.estimated_cost_usd == pytest.approx(spent1)
+    assert report2.plan_summary is not None
+    assert report2.plan_summary.mode == "auto"
+
+
+def test_reattach_provenance_matching_tiers():
+    """Exact normalized quote wins, anchor match second, title+message
+    similarity third; existing provenance is never overwritten; unmatched
+    comments stay untagged."""
+    from open_referee.pipeline.orchestrator import _reattach_provenance
+
+    sources = [
+        {
+            "title": "Bad total",
+            "quote": "the total is 480 items",
+            "paragraph_anchor": "Table 1 shows counts.",
+            "provenance": "deterministic",
+        },
+        {
+            "title": "Unproven theorem",
+            "quote": "every widget is stable",
+            "paragraph_anchor": "Theorem 1 states stability.",
+            "provenance": "claim_verify 2-of-2",
+        },
+        {
+            "title": "Sign error in Lemma 2",
+            "quote": "",
+            "paragraph_anchor": "",
+            "message": "The inequality direction flips under the stated assumptions.",
+            "provenance": "claim_verify 1-of-2 + arbitrated",
+        },
+    ]
+    final = [
+        # exact quote match (whitespace drift tolerated by _norm)
+        {"title": "reworded", "quote": "The  total is 480 items"},
+        # anchor match
+        {"title": "reworded 2", "quote": "", "paragraph_anchor": "Theorem 1 states stability."},
+        # only similarity can find this one (message nearly identical)
+        {
+            "title": "Sign error in Lemma 2 (adjusted)",
+            "quote": "",
+            "paragraph_anchor": "",
+            "message": "The inequality direction flips under the stated assumptions here.",
+        },
+        # nothing matches, and one that already has provenance
+        {"title": "orphan"},
+        {"title": "keep me", "quote": "x", "provenance": "already-there"},
+    ]
+    _reattach_provenance(final, sources)
+    assert final[0]["provenance"] == "deterministic"
+    assert final[1]["provenance"] == "claim_verify 2-of-2"
+    assert final[2]["provenance"] == "claim_verify 1-of-2 + arbitrated"
+    assert "provenance" not in final[3]
+    assert final[4]["provenance"] == "already-there"

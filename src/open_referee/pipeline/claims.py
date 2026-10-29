@@ -17,6 +17,7 @@ import re
 from open_referee.config import Config, ModelRole
 from open_referee.ingestion import Document, build_definitions_pack
 from open_referee.pipeline import prompts_claims
+from open_referee.pipeline.budget import DM_BATCH_COMMENTS
 from open_referee.pipeline.orchestrator import RolePool, _norm
 from open_referee.pipeline.state import Stage, StageStatus
 from open_referee.providers.base import ChatMessage
@@ -39,59 +40,189 @@ CLAIM_TYPE_ROLES = {
 }
 
 
+CHUNK_CHARS = 70_000  # single-prompt inputs beyond this get chunked
+
+
+def _inventory_chunks(doc: Document) -> list[str]:
+    """Manuscript text for the inventory, split at section boundaries when
+    large: keeps each prompt in the regime where reasoning models reliably
+    emit JSON (~20k tokens), instead of one 40k-token prompt."""
+    text = doc.full_text()[:MAX_MANUSCRIPT_CHARS]
+    if len(text) <= CHUNK_CHARS:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= CHUNK_CHARS * 1.2:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind("\n\n", 0, CHUNK_CHARS)
+        if cut < CHUNK_CHARS // 2:
+            cut = CHUNK_CHARS
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip()
+    return [c for c in chunks if len(c) > 500]
+
+
 async def run_claim_inventory(
-    pool: RolePool, doc: Document, triage: dict, cfg: Config
+    pool: RolePool, doc: Document, triage: dict, cfg: Config, output_budget: str = "default"
 ) -> list[dict]:
-    """CLAIMS stage: exhaustive atomic claim catalogue for the manuscript."""
-    user = prompts_claims.CLAIM_INVENTORY_USER.format(
-        title=doc.title,
-        triage_json=json.dumps(triage)[:3000],
-        manuscript=doc.full_text()[:MAX_MANUSCRIPT_CHARS],
-    )
+    """CLAIMS stage: exhaustive atomic claim catalogue for the manuscript.
+
+    Long manuscripts are catalogued chunk-by-chunk at section boundaries and
+    merged — smaller prompts keep reasoning models in the reliable-emission
+    regime and the catalogue gets fuller coverage of the back half."""
+    from open_referee.pipeline.budget import call_max_tokens
+
+    out: list[dict] = []
+    n = 0
+    chunks = _inventory_chunks(doc)
+    for ci, chunk in enumerate(chunks, 1):
+        user = prompts_claims.CLAIM_INVENTORY_USER.format(
+            title=doc.title,
+            triage_json=json.dumps(triage)[:3000],
+            manuscript=chunk,
+        )
+        if len(chunks) > 1:
+            user += (
+                f"\n\n[Manuscript part {ci} of {len(chunks)}; catalogue "
+                "the claims of THIS part; ids will be merged globally. Keep "
+                "each claim's components TERSE (<=60 words total) and report "
+                "at most 30 claims per part — the most important ones.]"
+            )
+        try:
+            res = await pool.complete_json(
+                ModelRole.STRONG,
+                prompts_claims.CLAIM_INVENTORY_SYSTEM,
+                user,
+                call_type="claim_inventory",
+                max_tokens=call_max_tokens("claim_inventory", output_budget),
+            )
+        except Exception as e:
+            logger.warning("claim inventory chunk %d failed: %s", ci, e)
+            continue
+        claims = res.get("claims", []) if isinstance(res, dict) else []
+        if not isinstance(claims, list):
+            continue
+        for c in claims:
+            if not isinstance(c, dict) or not c.get("components"):
+                continue
+            n += 1
+            c["id"] = f"cl{n:03d}"  # global ids across merged chunks
+            c.setdefault("type", "logical")
+            c.setdefault("importance", "supporting")
+            out.append(c)
+    return out
+
+
+def claim_role(ctype: str, routing: str) -> ModelRole:
+    """Role for a claim type under the plan's routing level.
+
+    base: today's split (strong re-derives math, small does mechanical checks).
+    strong: numerical/table claims also go to strong (recomputation covers the
+    mechanical part). all_strong: every claim on the strong model."""
+    base = CLAIM_TYPE_ROLES.get(ctype, ModelRole.SMALL)
+    if routing == "all_strong":
+        return ModelRole.STRONG
+    if routing == "strong" and ctype in ("numerical", "table_text"):
+        return ModelRole.STRONG
+    return base
+
+
+def _similar_comments(a: dict, b: dict) -> bool:
+    """Two comments flag the same issue (title+message overlap)."""
+    import difflib
+
+    ta = _norm(str(a.get("title", "")) + " " + str(a.get("message", "")))
+    tb = _norm(str(b.get("title", "")) + " " + str(b.get("message", "")))
+    if not ta or not tb:
+        return False
+    return difflib.SequenceMatcher(None, ta, tb).ratio() >= 0.6
+
+
+async def _arbitrate(pipeline, pool, claim: dict, candidate: dict) -> dict | None:
+    """Strong-model gate for a finding that only one verification pass found."""
+    if not pipeline.budget_allows("claim_arbitrate"):
+        return None
     try:
-        res = await pool.complete_json(
-            ModelRole.STRONG, prompts_claims.CLAIM_INVENTORY_SYSTEM, user
+        verdict = await pool.complete_json(
+            ModelRole.STRONG,
+            prompts_claims.ARBITRATE_SYSTEM,
+            prompts_claims.ARBITRATE_USER.format(
+                claim_id=claim.get("id"),
+                claim_type=claim.get("type"),
+                components=json.dumps(claim.get("components", {}))[:6000],
+                title=str(candidate.get("title", ""))[:200],
+                message=str(candidate.get("message", ""))[:1200],
+                quote=str(candidate.get("quote", ""))[:400],
+            ),
+            call_type="claim_arbitrate",
         )
     except Exception as e:
-        logger.warning("claim inventory failed: %s", e)
-        return []
-    claims = res.get("claims", [])
-    if not isinstance(claims, list):
-        return []
-    # basic sanitation
-    out = []
-    for i, c in enumerate(claims):
-        if not isinstance(c, dict) or not c.get("components"):
-            continue
-        c.setdefault("id", f"cl{i + 1:03d}")
-        c.setdefault("type", "logical")
-        c.setdefault("importance", "supporting")
-        out.append(c)
+        logger.warning("arbitration for claim %s failed: %s", claim.get("id"), e)
+        return None
+    if not verdict.get("confirmed"):
+        return None
+    out = dict(candidate)
+    if verdict.get("message"):
+        out["message"] = str(verdict["message"])[:2000]
+    if verdict.get("severity") is not None:
+        try:
+            out["score"] = float(verdict["severity"])
+        except (TypeError, ValueError):
+            pass
     return out
 
 
 async def verify_claims(
     pipeline, pool: RolePool, doc: Document, claims: list[dict], cfg: Config
 ) -> list[dict]:
-    """Per-claim verification workers, parallel with the configured cap."""
-    preset = cfg.review.depth_preset()
-    # central claims first, then supporting; peripheral only if budget remains
-    order = {"central": 0, "supporting": 1, "peripheral": 2}
-    ordered = sorted(claims, key=lambda c: order.get(str(c.get("importance")).lower(), 1))
-    selected = ordered[: preset.max_claims]
+    """Per-claim verification workers, parallel with the configured cap.
 
+    When the committee already importance-ranked the claims (auto mode), the
+    given order is authoritative; otherwise the inventory's coarse importance
+    sorts the queue (central first).
+
+    Depth engine: with verify_passes = k each claim is verified k times
+    independently (passes >= 2 route to the auditor model when configured).
+    A finding must reproduce in at least two passes to be confirmed outright;
+    a single-pass finding goes to a strong-model arbitration gate."""
+    knobs = pipeline.plan_knobs()
+    passes = max(1, int(getattr(knobs, "verify_passes", 1)))
+    routing = str(getattr(knobs, "claim_routing", "base")).lower()
+    out_budget = str(getattr(knobs, "output_budget", "default"))
+    from open_referee.pipeline.budget import call_max_tokens
+
+    if getattr(pipeline, "_claims_ranked", False):
+        ordered = list(claims)
+    else:
+        order = {"central": 0, "supporting": 1, "peripheral": 2}
+        ordered = sorted(claims, key=lambda c: order.get(str(c.get("importance")).lower(), 1))
+    selected = ordered[: knobs.max_claims]
+
+    auditor_available = ModelRole.AUDITOR in getattr(pool, "providers", {})
     sem = asyncio.Semaphore(cfg.review.max_parallel_calls)
     results: list[dict] = []
+    verified = 0
 
-    # definitions packs: built lazily per theorem environment, keyed by anchor
-    async def verify_one(claim: dict):
-        async with sem:
-            ctype = str(claim.get("type")).lower()
-            role = CLAIM_TYPE_ROLES.get(ctype, ModelRole.SMALL)
-            system = prompts_claims.claim_verify_system(ctype)
-            components = json.dumps(claim.get("components", {}), indent=1)[:12_000]
-            defs = _definitions_for(doc, claim)
-            user = prompts_claims.CLAIM_VERIFY_USER.format(
+    async def run_pass(claim: dict, pass_idx: int) -> list[dict]:
+        ctype = str(claim.get("type")).lower()
+        if pass_idx >= 1 and auditor_available:
+            role = ModelRole.AUDITOR
+        else:
+            role = claim_role(ctype, routing)
+        system = prompts_claims.claim_verify_system(ctype)
+        components = json.dumps(claim.get("components", {}), indent=1)[:12_000]
+        defs = _definitions_for(doc, claim)
+        pass_tag = (
+            f"\n\n[Independent verification pass {pass_idx + 1} of {passes}. "
+            "Re-derive everything from the definitions; do not assume earlier "
+            "passes were correct.]"
+            if passes > 1
+            else ""
+        )
+        user = (
+            prompts_claims.CLAIM_VERIFY_USER.format(
                 claim_id=claim.get("id"),
                 claim_type=ctype,
                 importance=claim.get("importance"),
@@ -99,24 +230,101 @@ async def verify_claims(
                 components=components,
                 definitions=defs[:6000],
             )
-            try:
-                res = await pool.complete_json(role, system, user)
-            except Exception as e:
-                logger.warning("claim %s (%s) failed: %s", claim.get("id"), ctype, e)
+            + pass_tag
+        )
+        res = await pool.complete_json(
+            role,
+            system,
+            user,
+            call_type="claim_verify",
+            max_tokens=call_max_tokens("claim_verify", out_budget),
+        )
+        comments = [c for c in res.get("comments", []) if isinstance(c, dict)]
+        for c in comments:
+            c.setdefault("paragraph_anchor", claim.get("anchor", ""))
+            c["claim_id"] = claim.get("id")
+        return comments
+
+    async def verify_one(claim: dict):
+        nonlocal verified
+        async with sem:
+            if not pipeline.budget_allows("claim_verify"):
                 return []
-            comments = res.get("comments", [])
-            for c in comments:
-                c.setdefault("paragraph_anchor", claim.get("anchor", ""))
-                c["claim_id"] = claim.get("id")
+            verified += 1
+            pass_results: list[list[dict]] = []
+            for pass_idx in range(passes):
+                try:
+                    pass_results.append(await run_pass(claim, pass_idx))
+                except Exception as e:
+                    logger.warning("claim %s pass %s failed: %s", claim.get("id"), pass_idx, e)
+                    pass_results.append([])
+            if passes == 1:
+                comments = pass_results[0]
+            else:
+                comments = await _aggregate_passes(pipeline, pool, claim, pass_results, passes)
+            # observed yield feeds the replanning committee
+            h = getattr(pool, "harness", None)
+            if h is not None and comments:
+                try:
+                    h.note_yield(
+                        "claim_verify",
+                        len(comments),
+                        max((float(c.get("score", 0)) for c in comments), default=0.0),
+                    )
+                except (TypeError, ValueError):
+                    pass
             await pipeline._emit(
-                Stage.VERIFY, StageStatus.RUNNING, f"claim {claim.get('id')} [{ctype}] verified"
+                Stage.VERIFY,
+                StageStatus.RUNNING,
+                f"claim {claim.get('id')} verified ({passes} pass)",
             )
             return comments
 
     tasks = [verify_one(c) for c in selected]
     for r in await asyncio.gather(*tasks):
         results.extend(r)
+    if verified < len(selected):
+        pipeline._note_gate_stop("claim_verify")
+        await pipeline._emit(
+            Stage.VERIFY,
+            StageStatus.RUNNING,
+            f"claim verification stopped at {verified}/{len(selected)} (budget projection)",
+        )
     return results
+
+
+async def _aggregate_passes(
+    pipeline, pool, claim: dict, pass_results: list[list[dict]], passes: int
+) -> list[dict]:
+    """Reproduction voting across independent passes.
+
+    Findings present in >= 2 passes are confirmed with a k-of-n provenance;
+    findings from a single pass go to the strong-model arbitration gate."""
+    clusters: list[dict] = []  # {comments: [...], passes: set[int]}
+    for pi, comments in enumerate(pass_results):
+        for c in comments:
+            placed = False
+            for cl in clusters:
+                if any(_similar_comments(c, oc) for oc in cl["comments"]):
+                    cl["comments"].append(c)
+                    cl["passes"].add(pi)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append({"comments": [c], "passes": {pi}})
+    confirmed: list[dict] = []
+    for cl in clusters:
+        best = max(cl["comments"], key=lambda c: float(c.get("score", 0) or 0))
+        if len(cl["passes"]) >= 2:
+            out = dict(best)
+            out["provenance"] = f"claim_verify {len(cl['passes'])}-of-{passes}"
+            confirmed.append(out)
+        else:
+            kept = await _arbitrate(pipeline, pool, claim, best)
+            if kept is not None:
+                kept["provenance"] = f"claim_verify 1-of-{passes} + arbitrated"
+                confirmed.append(kept)
+    return confirmed
 
 
 def _definitions_for(doc: Document, claim: dict) -> str:
@@ -174,7 +382,7 @@ def find_mentions(doc: Document, kind: str, artifact_id: str) -> list[str]:
 async def verify_artifacts(pipeline, pool: RolePool, doc: Document, cfg: Config) -> list[dict]:
     """Vision verification of ALL figures and tables against the prose."""
     out: list[dict] = []
-    preset = cfg.review.depth_preset()
+    knobs = pipeline.plan_knobs()
     if ModelRole.VISION not in pool.providers:
         return out
 
@@ -187,6 +395,9 @@ async def verify_artifacts(pipeline, pool: RolePool, doc: Document, cfg: Config)
     ):
         async with sem:
             if not image and not text_block:
+                return []
+            if not pipeline.budget_allows("artifact_verify"):
+                pipeline._note_gate_stop("artifact_verify")
                 return []
             mentions = find_mentions(doc, kind, artifact_id)
             if not mentions:
@@ -219,7 +430,9 @@ async def verify_artifacts(pipeline, pool: RolePool, doc: Document, cfg: Config)
             try:
                 await pool.ledger.check_budget(spec, 4000, 2000)
                 resp = await vision.complete(messages, json_mode=True)
-                await pool.ledger.record(spec, "vision", resp)
+                rec = await pool.ledger.record(spec, "vision", resp, call_type="artifact_verify")
+                if pool.harness is not None:
+                    pool.harness.note_record(rec)
                 from open_referee.providers.adapters import extract_json
 
                 comments = extract_json(resp.text).get("comments", [])
@@ -235,10 +448,10 @@ async def verify_artifacts(pipeline, pool: RolePool, doc: Document, cfg: Config)
                 return []
 
     tasks = []
-    for fig in doc.figures[: preset.max_artifacts]:
+    for fig in doc.figures[: knobs.max_artifacts]:
         if fig.image_data_url:
             tasks.append(check("figure", fig.id, fig.image_data_url, None, fig.page))
-    for tbl in doc.tables[: preset.max_artifacts]:
+    for tbl in doc.tables[: knobs.max_artifacts]:
         if tbl.image_data_url or tbl.markdown:
             tasks.append(check("table", tbl.id, tbl.image_data_url, tbl.markdown, tbl.page))
     for r in await asyncio.gather(*tasks):
@@ -261,19 +474,50 @@ def _near_page_blocks(doc: Document, page: int | None, window: int = 6) -> list[
 async def defense_round(
     pipeline, pool: RolePool, doc: Document, candidates: list[dict], cfg: Config
 ) -> list[dict]:
-    """Per-comment quality gate: authors' defense -> adjudication.
+    """Per-comment quality gate: authors' defense (small LLM) -> verdict.
 
-    Only for comments whose anchor resolves to document text (unanchored ones
-    go straight to the meta-reviewer, which re-checks them globally).
+    With a decision model configured, verdicts + recalibrated severity are
+    BATCHED decision questions (uphold/adjust/dismiss + severity rubric) in
+    one call over all comments; an LLM rewrites only 'adjust' comments.
+    Without one, the strong-model adjudicator adjudicates per comment.
+    Gate failures never drop a comment.
+
+    Deep plans (defense_second_round) run the whole gate a second time over
+    the survivors: only comments that withstand two independent adversarial
+    rounds reach the report, with the second round's severity verdict final.
     """
-    preset = cfg.review.depth_preset()
-    if not preset.defense_round or not candidates:
+    knobs = pipeline.plan_knobs()
+    if not knobs.defense_round or not candidates:
         return list(candidates)
 
+    if getattr(pool, "decider", None) is not None:
+        out = await _defense_round_dm(pipeline, pool, doc, candidates, cfg)
+    else:
+        out = await _defense_round_llm(pipeline, pool, doc, candidates, cfg)
+    if getattr(knobs, "defense_second_round", False) and out and len(out) < len(candidates):
+        await pipeline._emit(
+            Stage.CHALLENGE,
+            StageStatus.RUNNING,
+            f"second defense round on {len(out)} upheld comments",
+        )
+        if getattr(pool, "decider", None) is not None:
+            out = await _defense_round_dm(pipeline, pool, doc, out, cfg)
+        else:
+            out = await _defense_round_llm(pipeline, pool, doc, out, cfg)
+    return out
+
+
+async def _defense_defense_texts(
+    pipeline, pool: RolePool, doc: Document, candidates: list[dict], cfg: Config
+) -> list[str]:
+    """Authors' best honest defense per comment (small model), in parallel."""
     sem = asyncio.Semaphore(cfg.review.max_parallel_calls)
 
-    async def gate(c: dict) -> dict | None:
+    async def one(c: dict) -> str:
         async with sem:
+            if not pipeline.budget_allows("defense"):
+                pipeline._note_gate_stop("defense")
+                return "(no defense drafted — budget gate)"
             anchor = c.get("paragraph_anchor") or c.get("quote") or ""
             passage = _passage_for(doc, anchor) or "(anchor not found in document)"
             try:
@@ -286,6 +530,174 @@ async def defense_round(
                         message=(c.get("message") or "")[:1500],
                         passage=passage[:2500],
                     ),
+                    call_type="defense",
+                )
+                return (
+                    f"[{defense.get('defense_strength', 'unknown')}] "
+                    + (defense.get("defense") or "")[:1200]
+                )
+            except Exception as e:
+                logger.warning("defense drafting failed for %s: %s", c.get("title"), e)
+                return "(defense drafting failed)"
+
+    return list(await asyncio.gather(*(one(c) for c in candidates)))
+
+
+def _dm_listing(cands: list[dict], defenses: list[str], passages: list[str]) -> str:
+    """Decision-context listing: comment + defense + the manuscript passage
+    the comment is anchored to. The passage is the evidence an adjudicator
+    needs to check a defense against what the paper actually says; without
+    it a glib defense wins by assertion."""
+    return "\n".join(
+        f"{i}. [{c.get('title', '')[:70]}] severity={c.get('score')} "
+        f"message={(c.get('message') or '')[:300]}\n"
+        f"   defense: {defenses[i - 1][:300]}\n"
+        f"   passage: {passages[i - 1][:500]}"
+        for i, c in enumerate(cands, 1)
+    )
+
+
+async def _defense_round_dm(
+    pipeline, pool: RolePool, doc: Document, candidates: list[dict], cfg: Config
+) -> list[dict]:
+    """Decision-model adjudication: batched verdicts + severity.
+
+    One decide() call per DM_BATCH_COMMENTS batch, each batch carrying the
+    comment, its defense, AND the anchored manuscript passage. Batching
+    replaced a single monolithic call whose [:60_000] slice silently left
+    most verdict questions with no context on large comment sets."""
+    from open_referee.providers.decisions import ChoiceQuestion, ScoreQuestion
+
+    defenses = await _defense_defense_texts(pipeline, pool, doc, candidates, cfg)
+    passages = [
+        _passage_for(doc, c.get("paragraph_anchor") or c.get("quote") or "")
+        or "(anchor not found in document)"
+        for c in candidates
+    ]
+    sev_map = {"polish": 0.25, "minor": 0.45, "major": 0.7, "invalidating": 0.9}
+    kept: list[dict] = []
+    to_adjust: list[tuple[int, dict]] = []  # (original candidate index, comment)
+    for lo in range(0, len(candidates), DM_BATCH_COMMENTS):
+        batch = candidates[lo : lo + DM_BATCH_COMMENTS]
+        b_defenses = defenses[lo : lo + DM_BATCH_COMMENTS]
+        b_passages = passages[lo : lo + DM_BATCH_COMMENTS]
+        questions = []
+        for i in range(1, len(batch) + 1):
+            questions.append(
+                ChoiceQuestion(
+                    name=f"verdict_{i}",
+                    instructions=(
+                        f"Adjudicate comment {i} after reading its authors' defense "
+                        "and the manuscript passage it is anchored to — check the "
+                        "defense's claims against the passage, not just its rhetoric. "
+                        "dismiss = the defense refutes it; adjust = partially right, "
+                        "severity or wording needs correction; uphold = it stands."
+                    ),
+                    choices=[{"value": v} for v in ("uphold", "adjust", "dismiss")],
+                )
+            )
+            questions.append(
+                ScoreQuestion(
+                    name=f"severity_{i}",
+                    instructions=f"Recalibrated severity for comment {i} (if it stands).",
+                    levels=[
+                        {"label": "polish", "description": "0.1-0.34"},
+                        {"label": "minor", "description": "0.35-0.59"},
+                        {"label": "major", "description": "0.6-0.79"},
+                        {"label": "invalidating", "description": "0.8-1.0"},
+                    ],
+                )
+            )
+        listing = _dm_listing(batch, b_defenses, b_passages)
+        try:
+            dm = await pool.decide(
+                f"Manuscript: {doc.title}\n\nComments with defenses and the "
+                f"manuscript passages they are anchored to:\n\n{listing}"[:60_000],
+                questions,
+                call_type="dm_defense",
+            )
+        except Exception as e:
+            logger.warning("DM adjudication failed (%s); batch upheld", e)
+            kept.extend(dict(c) for c in batch)
+            continue
+        for i, c in enumerate(batch, 1):
+            v = dm.answer(f"verdict_{i}")
+            verdict = v.choice if v and v.choice else "uphold"
+            if verdict == "dismiss":
+                continue
+            cc = dict(c)
+            sv = dm.answer(f"severity_{i}")
+            if sv is not None and sv.probabilities:
+                best = max(sv.probabilities, key=lambda d: d.get("probability", 0))
+                label = best.get("label")
+                if label in sev_map:
+                    cc["score"] = sev_map[label]
+            if verdict == "adjust":
+                to_adjust.append((lo + i - 1, cc))
+            else:
+                kept.append(cc)
+
+    # LLM rewrites only the adjusted comments (usually few)
+    for idx, cc in to_adjust:
+        try:
+            rewrite = await pool.complete_json(
+                ModelRole.SMALL,
+                prompts_claims.ADJUDICATION_SYSTEM,
+                prompts_claims.ADJUDICATION_USER.format(
+                    title=cc.get("title", ""),
+                    quote=(cc.get("quote") or "")[:600],
+                    message=(cc.get("message") or "")[:1500],
+                    score=cc.get("score"),
+                    defense_strength="adjusted by decision model",
+                    defense=defenses[idx][:2000],
+                    passage=passages[idx][:2500],
+                ),
+                call_type="adjudication",
+            )
+            final = rewrite.get("comment")
+            if isinstance(final, dict) and final.get("message"):
+                merged = {k: v for k, v in cc.items() if k not in final}
+                merged.update(final)
+                kept.append(merged)
+            else:
+                kept.append(cc)
+        except Exception as e:
+            logger.warning("adjust rewrite failed for %s: %s", cc.get("title"), e)
+            kept.append(cc)
+
+    await pipeline._emit(
+        Stage.CHALLENGE,
+        StageStatus.RUNNING,
+        f"defense gate (decision model): {len(kept)}/{len(candidates)} comments upheld "
+        f"({len(to_adjust)} adjusted)",
+    )
+    return kept
+
+
+async def _defense_round_llm(
+    pipeline, pool: RolePool, doc: Document, candidates: list[dict], cfg: Config
+) -> list[dict]:
+    """Strong-model per-comment adjudication (no decision model configured)."""
+    sem = asyncio.Semaphore(cfg.review.max_parallel_calls)
+
+    async def gate(c: dict) -> dict | None:
+        async with sem:
+            if not pipeline.budget_allows("defense"):
+                pipeline._note_gate_stop("defense")
+                return c  # gate failure never drops a comment
+            anchor = c.get("paragraph_anchor") or c.get("quote") or ""
+            passage = _passage_for(doc, anchor) or "(anchor not found in document)"
+            try:
+                defense = await pool.complete_json(
+                    ModelRole.SMALL,
+                    prompts_claims.DEFENSE_SYSTEM,
+                    prompts_claims.DEFENSE_USER.format(
+                        title=c.get("title", ""),
+                        quote=(c.get("quote") or "")[:600],
+                        message=(c.get("message") or "")[:1500],
+                        passage=passage[:2500],
+                    ),
+                    call_type="defense",
                 )
                 adjudication = await pool.complete_json(
                     ModelRole.STRONG,
@@ -299,6 +711,7 @@ async def defense_round(
                         defense=(defense.get("defense") or "")[:2000],
                         passage=passage[:2500],
                     ),
+                    call_type="adjudication",
                 )
             except Exception as e:
                 logger.warning("defense gate failed for %s: %s", c.get("title"), e)

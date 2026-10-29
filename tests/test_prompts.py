@@ -55,7 +55,7 @@ def test_lenses_pure_prose_paper():
         }
     )
     names = [n for n, _ in lenses]
-    assert names == ["prose", "lit"]
+    assert names == ["prose", "lit", "clarity"]
 
 
 def test_lenses_missing_triage_fields_safe():
@@ -286,6 +286,7 @@ async def test_whole_paper_passes_run_in_pipeline(
     small.queue(json.dumps({"defense": "d", "defense_strength": "weak"}))
     strong.queue(json.dumps({"verdict": "upheld", "comment": wp}))
     strong.queue(json.dumps({"paper_summary": "s", "overall_feedback": "## F", "comments": [wp]}))
+    strong.queue(json.dumps({"overall_feedback": "## F"}))  # synthesis essay
     strong.queue(
         json.dumps(
             {

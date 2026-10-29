@@ -80,3 +80,21 @@ def test_extract_json_variants():
 def test_openai_provider_requires_base_url():
     with pytest.raises(LLMError):
         OpenAICompatibleProvider(spec(base_url=None))
+
+
+async def test_complete_json_repair_failure_raises_llmerror(test_config):
+    """A model that never produces JSON must fail as LLMError (stages catch
+    it and degrade) — never as a raw JSONDecodeError that kills the run."""
+    from open_referee.config import ModelRole
+    from open_referee.pipeline.orchestrator import RolePool
+    from open_referee.providers import LLMError
+
+    pool = RolePool.build(test_config, {ModelRole.STRONG})
+    strong = pool.providers[ModelRole.STRONG]
+    strong.queue("not json at all, just prose")
+    strong.queue("still not json, sorry")
+    try:
+        with pytest.raises(LLMError):
+            await pool.complete_json(ModelRole.STRONG, "system", "user")
+    finally:
+        await pool.close()
